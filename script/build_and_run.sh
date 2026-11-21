@@ -33,6 +33,13 @@ if [[ "${1-}" == "--password-group" ]]; then
   shift 2
 fi
 
+build_commit=""
+if [[ "$(git -C "$ROOT_DIR" rev-parse --show-toplevel 2>/dev/null)" == "$ROOT_DIR" ]] &&
+   build_status=$(git -C "$ROOT_DIR" status --porcelain --untracked-files=normal --ignore-submodules=none) &&
+   [[ -z "$build_status" ]]; then
+  build_commit=$(git -C "$ROOT_DIR" rev-parse --verify HEAD)
+fi
+
 swift build --package-path "$ROOT_DIR" -c release "$@"
 BIN_DIR=$(swift build --package-path "$ROOT_DIR" -c release "$@" --show-bin-path)
 
@@ -83,6 +90,13 @@ plutil -insert NSPrincipalClass -string NSApplication "$INFO_PLIST"
 plutil -insert NSHighResolutionCapable -bool true "$INFO_PLIST"
 plutil -insert NSAppTransportSecurity -xml '<dict><key>NSAllowsLocalNetworking</key><true/><key>NSAllowsArbitraryLoadsInWebContent</key><true/></dict>' "$INFO_PLIST"
 
+if [[ -n "$build_commit" && "$(git -C "$ROOT_DIR" rev-parse --verify HEAD)" == "$build_commit" ]] &&
+   build_status=$(git -C "$ROOT_DIR" status --porcelain --untracked-files=normal --ignore-submodules=none) &&
+   [[ -z "$build_status" ]]; then
+  cp "$ROOT_DIR/script/update_on_launch.sh" "$APP_BUNDLE/Contents/Resources/update_on_launch.sh"
+  plutil -insert GPTAMBuildCommit -string "$build_commit" "$INFO_PLIST"
+fi
+
 bash "$ROOT_DIR/script/sign_app_bundle.sh" "$APP_BUNDLE"
 if $BUILD_ONLY; then
   trap - EXIT
@@ -104,9 +118,9 @@ if [[ -n "${GPTAM_NEW_PASSWORD+x}" ]]; then
   export GPTAM_NEW_PASSWORD
 fi
 if [[ -n "$PASSWORD_GROUP" ]]; then
-  open -n "$APP_BUNDLE" --args --change-passwords-in-group-id "$PASSWORD_GROUP"
+  open -n "$APP_BUNDLE" --args --skip-git-update-on-launch --change-passwords-in-group-id "$PASSWORD_GROUP"
 else
-  open -n "$APP_BUNDLE"
+  open -n "$APP_BUNDLE" --args --skip-git-update-on-launch
 fi
 unset GPTAM_NEW_PASSWORD
 

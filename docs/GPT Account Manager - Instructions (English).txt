@@ -24,11 +24,12 @@ INSTALLATION AND UPDATES
     cd gpt-account-manager
     ./run.sh
 
-Use ./run.sh for future starts to check the configured Git upstream before
-building and opening the app. The launcher applies only fast-forward updates.
-If the checkout has local changes or the upstream is unavailable, it explains
-what happened and runs the local code. See the README for password configuration
-and the Safari extension.
+After the first build, open dist/GPT Account Manager.app from Finder or the
+Dock. At startup the app checks the public GitHub main branch, builds any
+fast-forward update, and relaunches. Keep the app in dist inside a clean clone
+on main tracking origin/main. If the check or build fails, the app opens the
+previous build. You can still run ./run.sh to update and build from Terminal.
+See the README for password configuration and the Safari extension.
 
 MAIN WINDOW
 
