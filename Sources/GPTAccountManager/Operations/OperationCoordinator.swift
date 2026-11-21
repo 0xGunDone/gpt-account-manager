@@ -75,6 +75,8 @@ enum RotationState {
 @MainActor
 @Observable
 final class OperationCoordinator {
+    static let missingRotationSessionMessage = "Исходная сессия недоступна. Выберите «Новый вход», чтобы продолжить с сохранённого этапа."
+
     private let store: AccountStore
     private let checker: SubscriptionChecking
     private let proxyStore: ProxyStore?
@@ -527,7 +529,7 @@ final class OperationCoordinator {
                 message = "Сначала продолжите или остановите текущую очередь смены доступов."
                 return
             }
-            await resumeRotation(id: id)
+            await continueRotation(id: id)
             return
         }
         let eligible = Set(store.accounts.filter {
@@ -538,12 +540,43 @@ final class OperationCoordinator {
     }
 
     func resumeRotation() async {
-        guard !isRunning, !hasPendingEmailChange, let id = pausedRotationAccountID else { return }
-        await resumeRotation(id: id)
+        guard let id = pausedRotationAccountID else { return }
+        await continueRotation(id: id)
+    }
+
+    func rotationResumeBlockReason(for id: UUID) -> String? {
+        if hasPendingEmailChange { return "Сначала завершите или остановите смену почты." }
+        if pausedAccountID != nil { return "Сначала завершите или остановите проверку подписки." }
+        if !pausedRotationAccountIDs.isEmpty && !pausedRotationAccountIDs.contains(id) {
+            return "Сначала продолжите или остановите приостановленную смену доступов другого аккаунта."
+        }
+        return nil
+    }
+
+    func rotationNeedsNewLogin(for id: UUID) -> Bool {
+        guard let browserRecovery,
+              let account = store.accounts.first(where: { $0.id == id }),
+              let context = recoveryContext(for: id), case .rotation = context,
+              !browserRecovery.hasCandidateSession(for: id),
+              BrowserRecoveryPolicy.availability(
+                context: context, hasTrustedPage: false, hasCandidate: false).freshLoginMode == .manualFactor
+        else { return false }
+
+        guard let session = browserRecovery.recoverySession(for: account, context: context) else { return true }
+        return session.needsInitialPageLoad && !session.canReloadTrustedPage
     }
 
     func continueRotation(id: UUID) async {
-        guard !isRunning, !hasPendingEmailChange, pausedAccountID == nil, rotator != nil else { return }
+        guard !isRunning, rotator != nil else { return }
+        if let reason = rotationResumeBlockReason(for: id) {
+            message = reason
+            return
+        }
+        if rotationNeedsNewLogin(for: id) {
+            store.selectedID = id
+            message = Self.missingRotationSessionMessage
+            return
+        }
         if pausedRotationAccountIDs.contains(id) {
             await resumeRotation(id: id)
             return
@@ -785,6 +818,10 @@ final class OperationCoordinator {
               let account = store.accounts.first(where: { $0.id == id }),
               let context = recoveryContext(for: id)
         else { return }
+        if case .rotation = context, let reason = rotationResumeBlockReason(for: id) {
+            message = reason
+            return
+        }
         beginBrowserRecovery(id: id)
         let result = await browserRecovery.startFreshLogin(for: account, context: context)
         endBrowserRecovery()

@@ -20,18 +20,19 @@ SYSTEM REQUIREMENTS
 
 INSTALLATION AND UPDATES
 
-    git clone --branch v1.1.0 https://github.com/0xGunDone/gpt-account-manager.git
+    git clone --branch v1.1.1 https://github.com/0xGunDone/gpt-account-manager.git
     cd gpt-account-manager
     git switch -c main
     git branch --set-upstream-to=origin/main main
     ./run.sh
 
 After the first build, open dist/GPT Account Manager.app from Finder or the
-Dock. At startup the app checks the latest stable GitHub release. It builds a
-fast-forward update from that release's tag and relaunches. Keep the app in
-dist inside a clean clone on main tracking origin/main. If the check or build
-fails, the app opens the installed version. ./run.sh uses the same update
-channel from Terminal.
+Dock. At startup the app checks the latest stable GitHub release and shows the
+version with Update and Later actions. After approval, the app shows download,
+build, and installation progress before relaunching. Keep the app in dist
+inside a clean clone on main tracking origin/main. If the check or build fails,
+you can continue with the installed version. ./run.sh uses the same release
+channel to update and build from Terminal.
 See the README for password configuration and the Safari extension.
 
 MAIN WINDOW

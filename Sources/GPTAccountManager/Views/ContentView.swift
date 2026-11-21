@@ -365,6 +365,7 @@ struct ContentView: View {
     private var detail: some View {
         if case .account(let id) = sidebarSelection,
            let account = store.accounts.first(where: { $0.id == id }) {
+            let showsRotationRecovery = account.rotationStage != nil || coordinator.pausedRotationAccountIDs.contains(id)
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
                     AccountDetailView(
@@ -383,6 +384,9 @@ struct ContentView: View {
                             account.rotationStage == nil &&
                             account.pendingTOTPSecret == nil && !account.hasPendingCredentialChange,
                         rotationState: coordinator.rotationStates[account.id],
+                        rotationResumeBlockReason: coordinator.rotationResumeBlockReason(for: id),
+                        rotationNeedsNewLogin: coordinator.rotationNeedsNewLogin(for: id),
+                        rotationRecoveryControls: showsRotationRecovery ? browserRecoveryControls(for: id) : nil,
                         onSaveCredentials: { text in
                             do {
                                 let credential = try ImportExportService
@@ -466,7 +470,7 @@ struct ContentView: View {
                             }
                         },
                         onResumeRotation: {
-                            Task { await coordinator.continueRotation(id: account.id) }
+                            continueRotation(for: id)
                         },
                         onVerifyManualPassword: { password in
                             Task { await coordinator.verifyManuallyChangedPassword(id: account.id, password: password) }
@@ -517,7 +521,7 @@ struct ContentView: View {
                         onShowMailbox: { mailbox.ensureLoaded(); openWindow(id: "mailbox") },
                         onShowAliases: { showEmailAliases = true })
                     .id("email-\(account.id)")
-                    operationStatus
+                    operationStatus(hidingRotationContinueFor: id)
                     codexImportStatus
                     if account.pendingRegistration != nil {
                         Button("Продолжить регистрацию") {
@@ -527,7 +531,7 @@ struct ContentView: View {
                         .disabled(registration.isRunning && registration.accountID != account.id)
                     }
                     if !showRegistration || registration.accountID != account.id {
-                        browserPanel(account: account)
+                        browserPanel(account: account, showRecoveryControls: !showsRotationRecovery)
                     }
                 }
                 .frame(maxWidth: 760, alignment: .leading)
@@ -617,7 +621,7 @@ struct ContentView: View {
                         guard let group else { return }
                         pendingDeletion = .group(group.id, accountCount: accounts.count)
                     })
-                operationStatus
+                operationStatus()
                 codexImportStatus
             }
             .frame(maxWidth: 900, alignment: .leading)
@@ -758,7 +762,7 @@ struct ContentView: View {
     }
 
     @ViewBuilder
-    private var operationStatus: some View {
+    private func operationStatus(hidingRotationContinueFor displayedID: UUID? = nil) -> some View {
         if coordinator.isRunning || coordinator.totalCount > 0 || coordinator.message != nil ||
             coordinator.pausedAccountID != nil || coordinator.pausedRotationAccountID != nil {
             VStack(alignment: .leading, spacing: 10) {
@@ -788,10 +792,11 @@ struct ContentView: View {
                             Task { await coordinator.resume() }
                         }
                     }
-                    if coordinator.pausedRotationAccountID != nil {
+                    if let pausedID = coordinator.pausedRotationAccountID, displayedID != pausedID {
                         Button("Продолжить смену доступов") {
-                            Task { await coordinator.resumeRotation() }
+                            continueRotation(for: pausedID)
                         }
+                        .disabled(coordinator.isRunning || codexImportBlocked || accessTokenCopying)
                     }
                     if !coordinator.isRunning && !coordinator.emailQueueAccountIDs.isEmpty {
                         Button("Продолжить смену почты группы") {
@@ -803,6 +808,15 @@ struct ContentView: View {
             }
             .padding(.top, 4)
         }
+    }
+
+    private func continueRotation(for id: UUID) {
+        if coordinator.rotationResumeBlockReason(for: id) == nil && coordinator.rotationNeedsNewLogin(for: id) {
+            store.selectedID = id
+            pendingFreshLoginID = id
+            return
+        }
+        Task { await coordinator.continueRotation(id: id) }
     }
 
     @ViewBuilder
@@ -845,24 +859,21 @@ struct ContentView: View {
         }
     }
 
+    private func browserRecoveryControls(for id: UUID) -> BrowserRecoveryControlsView? {
+        guard let availability = coordinator.recoveryAvailability(for: id) else { return nil }
+        return BrowserRecoveryControlsView(
+            availability: availability,
+            onReload: { Task { await coordinator.reloadBrowser(for: id) } },
+            onReopen: { Task { await coordinator.reopenBrowserSection(for: id) } },
+            onFreshLogin: { pendingFreshLoginID = id },
+            onReturnToOriginal: { coordinator.returnToOriginalBrowserSession(for: id) })
+    }
+
     @ViewBuilder
-    private func browserPanel(account: AccountRecord) -> some View {
+    private func browserPanel(account: AccountRecord, showRecoveryControls: Bool) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            if let availability = coordinator.recoveryAvailability(for: account.id) {
-                BrowserRecoveryControlsView(
-                    availability: availability,
-                    onReload: {
-                        Task { await coordinator.reloadBrowser(for: account.id) }
-                    },
-                    onReopen: {
-                        Task { await coordinator.reopenBrowserSection(for: account.id) }
-                    },
-                    onFreshLogin: {
-                        pendingFreshLoginID = account.id
-                    },
-                    onReturnToOriginal: {
-                        coordinator.returnToOriginalBrowserSession(for: account.id)
-                    })
+            if showRecoveryControls, let controls = browserRecoveryControls(for: account.id) {
+                controls
                     .disabled(codexImportBlocked || accessTokenCopying)
             }
             if let session = codexImporter.browserSession(for: account.id) ?? coordinator.browserSession(for: account.id) {

@@ -13,6 +13,9 @@ struct AccountDetailView: View {
     let isRotationPaused: Bool
     let credentialsEditable: Bool
     let rotationState: RotationQueueItemState?
+    let rotationResumeBlockReason: String?
+    let rotationNeedsNewLogin: Bool
+    let rotationRecoveryControls: BrowserRecoveryControlsView?
     let onSaveCredentials: (String) -> String?
     let onSaveExternalMailbox: (ExternalMailboxConfiguration?) -> String?
     let onCopyOneTimeCode: (String) -> Void
@@ -59,6 +62,9 @@ struct AccountDetailView: View {
         isRotationPaused: Bool,
         credentialsEditable: Bool,
         rotationState: RotationQueueItemState?,
+        rotationResumeBlockReason: String?,
+        rotationNeedsNewLogin: Bool,
+        rotationRecoveryControls: BrowserRecoveryControlsView?,
         onSaveCredentials: @escaping (String) -> String?,
         onSaveExternalMailbox: @escaping (ExternalMailboxConfiguration?) -> String?,
         onCopyOneTimeCode: @escaping (String) -> Void,
@@ -87,6 +93,9 @@ struct AccountDetailView: View {
         self.isRotationPaused = isRotationPaused
         self.credentialsEditable = credentialsEditable
         self.rotationState = rotationState
+        self.rotationResumeBlockReason = rotationResumeBlockReason
+        self.rotationNeedsNewLogin = rotationNeedsNewLogin
+        self.rotationRecoveryControls = rotationRecoveryControls
         self.onSaveCredentials = onSaveCredentials
         self.onSaveExternalMailbox = onSaveExternalMailbox
         self.onCopyOneTimeCode = onCopyOneTimeCode
@@ -238,10 +247,25 @@ struct AccountDetailView: View {
                                 stage: account.rotationStage))
                 if canContinueRotation {
                     Button("Продолжить смену доступов", action: onResumeRotation)
-                        .disabled(recoveryActionsDisabled || passwordSetupRequired)
+                        .disabled(recoveryActionsDisabled || passwordSetupRequired || rotationResumeBlockReason != nil)
                 }
                 Button("Удалить аккаунт", role: .destructive, action: onDelete)
                     .disabled(deletionDisabled)
+            }
+
+            if canContinueRotation, let reason = rotationResumeBlockReason {
+                Text(reason)
+                    .font(.callout).foregroundStyle(.secondary)
+            } else if rotationNeedsNewLogin {
+                Text(OperationCoordinator.missingRotationSessionMessage)
+                    .font(.callout).foregroundStyle(.secondary)
+            } else if let rotationState {
+                Text(rotationLabel(rotationState))
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            if let rotationRecoveryControls {
+                rotationRecoveryControls
+                    .disabled(recoveryActionsDisabled || rotationResumeBlockReason != nil)
             }
 
             VStack(alignment: .leading, spacing: 6) {
@@ -252,11 +276,6 @@ struct AccountDetailView: View {
                     .foregroundStyle(.secondary)
             }
 
-            if let rotationState {
-                Text(rotationLabel(rotationState))
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
             if account.pendingAccessChangeMode?.changesPassword == true, account.rotationStage == nil,
                account.accessChangePasswordVerified != true {
                 if account.pendingPassword != nil {
@@ -431,7 +450,8 @@ struct AccountDetailView: View {
         case .failed: "Ошибка"
         case .needsRecovery:
             account.hasPendingEmailChange ? "Смена email не завершена" :
-                (account.rotationStage.map(RotationStagePresentation.status(for:)) ??
+                (rotationNeedsNewLogin ? "Смена 2FA приостановлена" :
+                    account.rotationStage.map(RotationStagePresentation.status(for:)) ??
                 "Требуется восстановление доступов")
         }
     }

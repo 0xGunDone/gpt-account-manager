@@ -746,6 +746,23 @@ private final class FakeBrowserRecovery: BrowserRecoveryHandling {
         #expect(store.accounts[0].status == .ready)
     }
 
+    @Test func persistedRemovalWithNoBrowserRequestsNewLoginWithoutStartingRotation() async throws {
+        let store = try store(accountCount: 1)
+        let id = store.accounts[0].id
+        try store.mutate(id: id) { RotationState.markRemovalStarted(in: &$0) }
+        let rotator = FakeRotator()
+        let recovery = FakeBrowserRecovery()
+        let coordinator = OperationCoordinator(
+            store: store, checker: FakeChecker(), rotator: rotator, browserRecovery: recovery)
+
+        await coordinator.continueRotation(id: id)
+
+        #expect(coordinator.message?.contains("Новый вход") == true)
+        #expect(rotator.calls == 0)
+        #expect(recovery.freshCalls.isEmpty)
+        #expect(store.accounts[0].rotationStage == .removingOldMethod)
+    }
+
     @Test func groupRotationStaysSerialEvenWithLegacyParallelRequest() async throws {
         let store = try store(accountCount: 5)
         let group = try store.createGroup(name: "Пачка", tag: nil)

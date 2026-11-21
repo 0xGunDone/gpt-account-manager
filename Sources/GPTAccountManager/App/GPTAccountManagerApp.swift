@@ -29,10 +29,38 @@ struct GPTAccountManagerApp: App {
         if update.phase == .ready {
             content()
         } else {
-            VStack(spacing: 12) {
-                ProgressView()
+            VStack(spacing: 16) {
                 Text(update.phase.title)
+                    .font(.headline)
+                switch update.phase {
+                case .available:
+                    Text("Приложение загрузит исходники стабильного релиза, соберёт новую версию и перезапустится.")
+                        .foregroundStyle(.secondary)
+                    HStack {
+                        Button("Позже", action: update.useInstalledVersion)
+                            .keyboardShortcut(.cancelAction)
+                        Button("Обновить", action: update.installAvailableRelease)
+                            .keyboardShortcut(.defaultAction)
+                    }
+                case .checkFailed, .failed:
+                    Text("Можно продолжить работу в установленной версии.")
+                        .foregroundStyle(.secondary)
+                    Button("Продолжить", action: update.useInstalledVersion)
+                        .keyboardShortcut(.defaultAction)
+                case .checking:
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel(update.phase.title)
+                    Button("Пропустить проверку", action: update.useInstalledVersion)
+                default:
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel(update.phase.title)
+                }
             }
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: 420)
+            .padding()
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .onAppear(perform: update.start)
         }
