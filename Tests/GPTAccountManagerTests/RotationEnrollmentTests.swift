@@ -87,6 +87,49 @@ struct RotationEnrollmentTests {
         #expect(snapshot.signedInEmail == account.email)
     }
 
+    @Test func interruptedRemovalSubmitsTheStoredFactorOnlyOnce() async throws {
+        let session = try await fixture(secret: "KRSXG5DSNFXGOIDB", resuming: false)
+        let automation = ChatGPTAutomation(sessionManager: WebSessionManager())
+        var account = AccountRecord(credential: .init(
+            email: "owner@example.com", password: "fixture-password", totpSecret: "JBSWY3DPEHPK3PXP"))
+        account.rotationStage = .removingOldMethod
+        session.webView.loadHTMLString("""
+            <h1>Проверьте приложение для аутентификации</h1>
+            <form onsubmit="event.preventDefault();window.submissions++">
+              <label>Одноразовый код <input name="code" autocomplete="one-time-code"></label>
+              <button>Продолжить</button>
+            </form>
+            <script>window.submissions = 0</script>
+            """, baseURL: URL(string: "https://auth.openai.com/mfa-challenge/fixture"))
+        let loadDeadline = ContinuousClock.now + .seconds(5)
+        while session.webView.isLoading && ContinuousClock.now < loadDeadline {
+            try await Task.sleep(for: .milliseconds(30))
+        }
+        let proof = CleanLoginProof(passwordSubmitted: true, pendingOTPSubmitted: false)
+        let login = Task {
+            await automation.signIn(account: account, secret: account.totpSecret, in: session,
+                                    initialProof: proof, automaticallySubmitOTP: false, waitForManualFactor: true,
+                                    loginTimeoutSeconds: 18, humanChallengeTimeoutSeconds: 12)
+        }
+        defer { login.cancel() }
+        let submissionDeadline = ContinuousClock.now + .seconds(16)
+        while ContinuousClock.now < submissionDeadline,
+              try await session.evaluate("submissions") as? Int == 0 {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        try #require(try await session.evaluate("submissions") as? Int == 1)
+        _ = try await session.evaluate("document.body.insertAdjacentHTML('beforeend', '<p id=error>Неверный код</p>')")
+        guard case .manual = await login.value else {
+            Issue.record("Recovery must keep the browser open after the provider rejects the code")
+            return
+        }
+        _ = try await session.evaluate("(() => { document.querySelector('#error').remove(); document.querySelector('input').value = '' })()")
+        _ = await automation.signIn(account: account, secret: account.totpSecret, in: session,
+                                    initialProof: proof, automaticallySubmitOTP: false, waitForManualFactor: true,
+                                    loginTimeoutSeconds: 1, humanChallengeTimeoutSeconds: 1)
+        #expect(try await session.evaluate("submissions") as? Int == 1)
+    }
+
     private func fixture(secret: String, resuming: Bool) async throws -> BrowserSession {
         _ = NSApplication.shared
         let session = BrowserSession(dataStore: .nonPersistent()) { configuration in

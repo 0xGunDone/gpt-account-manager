@@ -83,7 +83,9 @@ enum EmailChangeForm {
         """) as? Bool == true
     }
 
-    static func submitAuthenticatorCode(_ code: String, expectedPageURL: URL?, in session: BrowserSession) async throws -> ChatGPTAutomation.FormResult {
+    static func submitAuthenticatorCode(
+        _ code: String, expectedPageURL: URL?, in session: BrowserSession, requiresEmptyField: Bool = false
+    ) async throws -> ChatGPTAutomation.FormResult {
         try Task.checkCancellation()
         try requireTrustedOrigin(session)
         guard code.count == 6, code.allSatisfy({ $0 >= "0" && $0 <= "9" }),
@@ -105,7 +107,7 @@ enum EmailChangeForm {
         if (!['text','tel','number'].includes(field.type) || !enabled(field) || field.readOnly ||
             !['код','одноразовый код','code','one-time code','verification code'].includes(fieldLabel(field))) return 'ambiguous';
         const headings = [...document.querySelectorAll('h1,h2,h3,[role="heading"]')].filter(visible)
-          .filter(e => norm(e.innerText) === 'проверьте приложение для аутентификации');
+          .filter(e => ['проверьте приложение для аутентификации', 'check your authenticator app'].includes(norm(e.innerText)));
         if (headings.length !== 1) return 'ambiguous';
         const form = field.form;
         if (!form) return 'noForm';
@@ -118,6 +120,7 @@ enum EmailChangeForm {
         let filled = try await session.evaluate("""
         (() => {
           \(findChallenge)
+          if (\(requiresEmptyField) && field.value !== '') return 'ambiguous';
           for (const element of [document,form,field]) element.__gptAccountEmailAuthenticatorAttempt = \(attempt);
           Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(field,\(value));
           field.dispatchEvent(new Event('input',{bubbles:true}));

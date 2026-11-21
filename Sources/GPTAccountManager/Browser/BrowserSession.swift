@@ -143,6 +143,7 @@ final class BrowserSession: NSObject, ObservableObject, WKNavigationDelegate, WK
     private var hasCommittedPage = false
     @Published private(set) var pageLoadMessage: String?
     @Published private(set) var operationMessage: String?
+    var hasAttemptedRotationRecoveryOTP = false
     private var oauthPolicy: OAuthNavigationPolicy?
     @Published private(set) var oauthMessage: String?
     @Published private(set) var callbackURL: URL?

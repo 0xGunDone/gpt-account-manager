@@ -43,8 +43,11 @@ enum BrowserRecoveryPolicy {
             mode = .storedSecret
             destination = hasCandidate ? nil : .security
             warning = "Смена 2FA ещё не началась; можно безопасно повторить вход."
-        case .rotation(stage: .removingOldMethod),
-             .rotation(stage: .oldMethodDisabled),
+        case .rotation(stage: .removingOldMethod):
+            mode = .manualFactor
+            destination = hasCandidate ? nil : .security
+            warning = "После входа с паролем приложение один раз попробует сохранённый 2FA на распознанной форме OpenAI."
+        case .rotation(stage: .oldMethodDisabled),
              .rotation(stage: .pendingSecretCaptured):
             mode = .manualFactor
             destination = hasCandidate ? nil : .security

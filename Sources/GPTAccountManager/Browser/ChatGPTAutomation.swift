@@ -582,7 +582,7 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
             recoveryCandidateSessions[account.id] = candidate
             activeSession = candidate
             candidate.setVisible(true)
-            return .readyToContinue("Открыт новый вход без автоматической отправки старого 2FA.")
+            return .readyToContinue("Открыт новый вход для восстановления смены 2FA.")
         }
     }
 
@@ -2710,6 +2710,8 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
         }
         var authenticationErrorRetries = 0
         let isRegistrationRecovery = registrationProfileHandler != nil
+        let canTryStoredRecoveryOTP = waitForManualFactor && account.rotationStage == .removingOldMethod &&
+            account.pendingTOTPSecret == nil && secret == account.totpSecret && TOTPService.isValidSecret(secret)
         var redirectedRegistration = false
         if requireExplicitProof {
             session.setOperationMessage("Проверочный вход: вход с новым 2FA…")
@@ -2781,10 +2783,13 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                 return .failure("Аккаунт OpenAI удалён или деактивирован.")
             }
             if (try? await hasRejectedAuthenticatorCode(in: session)) == true {
+                if canTryStoredRecoveryOTP, session.hasAttemptedRotationRecoveryOTP {
+                    return .manual("OpenAI отклонил сохранённый 2FA. Выберите способ восстановления в открытом браузере.", proof)
+                }
                 return .failure("OpenAI отклонил одноразовый код. Проверьте сохранённый 2FA-ключ аккаунта.")
             }
             if (try? await hasAuthenticationServerError(in: session)) == true {
-                if authenticationErrorRetries < 1 {
+                if authenticationErrorRetries < 1 && !(canTryStoredRecoveryOTP && session.hasAttemptedRotationRecoveryOTP) {
                     authenticationErrorRetries += 1
                     if (try? await clickUniqueControl(
                         labels: retryLabels,
@@ -3031,7 +3036,7 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                 let passwordResult: FormResult
                 if automaticallyWaitForTransitions && submittedStages.contains(stage + ":password") {
                     passwordResult = .notFound
-                } else if (requireExplicitProof || isRegistrationRecovery || passwordLoginRequest != nil || externalMail != nil) && (session.webView.url?.host?.lowercased() != "auth.openai.com" ||
+                } else if (requireExplicitProof || isRegistrationRecovery || canTryStoredRecoveryOTP || passwordLoginRequest != nil || externalMail != nil) && (session.webView.url?.host?.lowercased() != "auth.openai.com" ||
                     session.webView.url?.path.lowercased() != "/log-in/password") {
                     passwordResult = .notFound
                 } else {
@@ -3060,8 +3065,8 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                     ) {
                         try await fillAndSubmit(
                             selectors: passwordSelectors, value: account.password, context: .authentication, in: session,
-                            expectedPageURL: passwordLoginRequest != nil || beforePasswordSubmission != nil || externalMail != nil ? passwordPageURL : recoveryPageURL,
-                            expectedEmail: isRegistrationRecovery || passwordLoginRequest != nil || beforePasswordSubmission != nil || externalMail != nil ? account.email : nil)
+                            expectedPageURL: canTryStoredRecoveryOTP || passwordLoginRequest != nil || beforePasswordSubmission != nil || externalMail != nil ? passwordPageURL : recoveryPageURL,
+                            expectedEmail: isRegistrationRecovery || canTryStoredRecoveryOTP || passwordLoginRequest != nil || beforePasswordSubmission != nil || externalMail != nil ? account.email : nil)
                     }
                 }
                 if passwordResult == .ambiguous || passwordResult == .noForm {
@@ -3083,6 +3088,25 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                 guard automaticallySubmitOTP else {
                     session.setVisible(true)
                     if waitForManualFactor {
+                        if canTryStoredRecoveryOTP, proof.passwordSubmitted, !session.hasAttemptedRotationRecoveryOTP,
+                           let pageURL, pageURL.host?.lowercased() == "auth.openai.com", path.hasPrefix("/mfa-challenge/") {
+                            let delay = TOTPService.safeSubmissionDelay(minimumRemaining: 10)
+                            if delay > 0 { try await Task.sleep(for: .seconds(delay + 0.15)) }
+                            guard !operationIsCancelled, generation == session.cancellationGeneration else { return .failure("Stopped") }
+                            guard session.webView.url == pageURL, !session.hasAttemptedRotationRecoveryOTP else { continue }
+                            // Keep the attempt through resume, including an uncertain submission result.
+                            session.hasAttemptedRotationRecoveryOTP = true
+                            let result = try await EmailChangeForm.submitAuthenticatorCode(
+                                TOTPService.code(secret: secret), expectedPageURL: pageURL, in: session, requiresEmptyField: true)
+                            if result == .submitted {
+                                waitingForManualFactor = true
+                                deadline = min(limit, clock.now.advanced(by: .seconds(loginTimeoutSeconds)))
+                                session.setOperationMessage("Код 2FA отправлен. Ожидается подтверждение входа OpenAI…")
+                                await waitAfterSubmission(in: session)
+                                continue
+                            }
+                            if result == .notFound { session.hasAttemptedRotationRecoveryOTP = false }
+                        }
                         if !waitingForManualFactor,
                            pageURL?.host?.lowercased() == "auth.openai.com", path.hasPrefix("/mfa-challenge/") {
                             waitingForManualFactor = true
