@@ -169,6 +169,8 @@ struct BrowserLoadingTests {
             return
         }
         #expect(views.count == 3)
+        let loginURL = URL(string: "https://chatgpt.com/auth/login")
+        #expect(views.allSatisfy { $0.requests.map(\.url) == [loginURL] })
         #expect(checkpoints.isEmpty)
         #expect(automation.cleanLoginSession(for: account) === session)
         #expect(account.pendingTOTPSecret == "KRUGS4ZANFZSAYJA")

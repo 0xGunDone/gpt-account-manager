@@ -7,7 +7,7 @@
 Для сборки нужны macOS 14 или новее, Git, Swift 6 (Xcode 16 или новее либо совместимые Command Line Tools) и Node.js 20+ с npm. При первом запуске npm загрузит зависимости из реестра.
 
 ```bash
-git clone --branch v1.1.2 https://github.com/0xGunDone/gpt-account-manager.git
+git clone --branch v1.1.3 https://github.com/0xGunDone/gpt-account-manager.git
 cd gpt-account-manager
 git switch -c main
 git branch --set-upstream-to=origin/main main

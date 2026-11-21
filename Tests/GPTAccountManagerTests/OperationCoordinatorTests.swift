@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import WebKit
 @testable import GPTAccountManager
 
 @MainActor
@@ -211,6 +212,10 @@ private final class FakeBrowserRecovery: BrowserRecoveryHandling {
     ) -> BrowserSession? { session }
 
     func hasCandidateSession(for accountID: UUID) -> Bool { hasCandidate }
+
+    func rotationRecoverySessionState(for account: AccountRecord) -> RotationRecoverySessionState {
+        .unavailable
+    }
 
     func reloadRecoveryPage(
         for account: AccountRecord,
@@ -761,6 +766,38 @@ private final class FakeBrowserRecovery: BrowserRecoveryHandling {
         #expect(rotator.calls == 0)
         #expect(recovery.freshCalls.isEmpty)
         #expect(store.accounts[0].rotationStage == .removingOldMethod)
+    }
+
+    @Test func loadedUnprovenRotationBrowserRequestsFreshLoginWithoutStartingRotation() async throws {
+        let store = try store(accountCount: 1)
+        let id = store.accounts[0].id
+        try store.mutate(id: id) { RotationState.markRemovalStarted(in: &$0) }
+        let account = store.accounts[0]
+        let rotator = FakeRotator()
+        let recovery = ChatGPTAutomation(sessionManager: WebSessionManager())
+        let coordinator = OperationCoordinator(
+            store: store, checker: FakeChecker(), rotator: rotator, browserRecovery: recovery)
+
+        recovery.prepareBrowserSession(for: account)
+        let session = try #require(recovery.recoverySession(for: account, context: .rotation(stage: .removingOldMethod)))
+        let url = URL(string: "https://chatgpt.com/#settings/Security")!
+        session.webView.navigationDelegate = nil
+        session.webView.loadHTMLString("<html><body>Security</body></html>", baseURL: url)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while (session.webView.isLoading || session.webView.url != url), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        try #require(!session.webView.isLoading && session.webView.url == url)
+        #expect(session.canReloadTrustedPage && !session.needsInitialPageLoad)
+        #expect(recovery.rotationRecoverySessionState(for: account) == .unavailable)
+
+        #expect(coordinator.rotationNeedsNewLogin(for: id))
+        await coordinator.continueRotation(id: id)
+
+        #expect(coordinator.message == OperationCoordinator.missingRotationSessionMessage)
+        #expect(rotator.calls == 0)
+        #expect(!recovery.hasCandidateSession(for: id))
+        #expect(store.accounts[0] == account)
     }
 
     @Test func groupRotationStaysSerialEvenWithLegacyParallelRequest() async throws {

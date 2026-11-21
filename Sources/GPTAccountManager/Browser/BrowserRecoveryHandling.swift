@@ -13,6 +13,7 @@ protocol BrowserRecoveryHandling: AnyObject {
         context: BrowserRecoveryContext
     ) -> BrowserSession?
     func hasCandidateSession(for accountID: UUID) -> Bool
+    func rotationRecoverySessionState(for account: AccountRecord) -> RotationRecoverySessionState
     func reloadRecoveryPage(
         for account: AccountRecord,
         context: BrowserRecoveryContext

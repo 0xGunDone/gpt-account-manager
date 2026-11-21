@@ -372,11 +372,12 @@ import WebKit
         #expect(clicked as? String == "login")
     }
 
-    @Test func cookieConsentPrefersOnlyNecessaryCookies() async throws {
+    @Test(arguments: ["Сохранять только обязательные", "Отклонить необязательные", "Отклонить второстепенные файлы cookie"])
+    func cookieConsentPrefersOnlyNecessaryCookies(label: String) async throws {
         let session = try await fixtureSession(
             """
             <html><body>
-              <button id="necessary">Сохранять только обязательные</button>
+              <button id="necessary">\(label)</button>
               <button id="all">Принять все</button>
               <script>
                 for (const id of ['necessary', 'all']) {

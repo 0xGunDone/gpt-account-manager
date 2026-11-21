@@ -459,6 +459,8 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
         "Сохранить только обязательные",
         "Сохранять только необходимые",
         "Только необходимые",
+        "Отклонить необязательные",
+        "Отклонить второстепенные файлы cookie",
         "Only necessary",
         "Only required",
         "Reject optional cookies",
@@ -2156,7 +2158,7 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
         defer { session.setOperationMessage(nil) }
 
         if session.needsInitialPageLoad {
-            guard await session.loadInitialPage(URL(string: "https://chatgpt.com/")!, seconds: 10, attempts: 3) else {
+            guard await session.loadInitialPage(URL(string: "https://chatgpt.com/auth/login")!, seconds: 10, attempts: 3) else {
                 if operationIsCancelled {
                     return .failure(stage: .awaitingCleanLogin, message: "Stopped")
                 }

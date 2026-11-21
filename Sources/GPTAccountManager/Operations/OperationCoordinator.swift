@@ -562,7 +562,9 @@ final class OperationCoordinator {
                 context: context, hasTrustedPage: false, hasCandidate: false).freshLoginMode == .manualFactor
         else { return false }
 
-        guard let session = browserRecovery.recoverySession(for: account, context: context) else { return true }
+        guard browserRecovery.rotationRecoverySessionState(for: account) == .authenticated,
+              let session = browserRecovery.recoverySession(for: account, context: context)
+        else { return true }
         return session.needsInitialPageLoad && !session.canReloadTrustedPage
     }
 
