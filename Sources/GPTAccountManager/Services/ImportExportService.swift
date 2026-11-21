@@ -15,11 +15,25 @@ enum CredentialImportSeparator: Equatable, Sendable {
 }
 
 enum ImportExportService {
-    private enum BlockField: String {
-        case email, password
-        case twoFA = "2fa"
-        case mailbox = "mailbox email"
-        case codeURL = "ссылка для кода с почты"
+    private enum BlockField {
+        case email, password, twoFA, mailbox, codeURL
+
+        init?(label: String) {
+            let words = label.lowercased().split(whereSeparator: { $0.isWhitespace || $0 == "-" || $0 == "_" })
+            switch words.joined(separator: " ") {
+            case "email", "e mail", "login", "account email", "email address", "логин", "email аккаунта", "почта аккаунта", "адрес электронной почты":
+                self = .email
+            case "password", "pass", "пароль":
+                self = .password
+            case "2fa", "2fa secret", "2fa key", "totp", "totp secret", "totp key", "ключ 2fa", "секрет 2fa":
+                self = .twoFA
+            case "mailbox email", "mailbox address", "почта ящика", "адрес ящика", "адрес почтового ящика":
+                self = .mailbox
+            case "mailbox code link", "mailbox code url", "code link", "code url", "ссылка для кода с почты", "ссылка на код с почты", "ссылка для получения кода":
+                self = .codeURL
+            default: return nil
+            }
+        }
     }
 
     static func parseCredentialLine(_ rawLine: String) throws -> ImportedCredential {
@@ -64,7 +78,7 @@ enum ImportExportService {
         var issues: [ImportIssue] = []
         var duplicates: [String] = []
 
-        let lines = text.components(separatedBy: .newlines)
+        let lines = text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).map(String.init)
         var nextLine = 0
         while nextLine < lines.count {
             let offset = nextLine
@@ -74,6 +88,7 @@ enum ImportExportService {
             var credential: ImportedCredential
             do {
                 if let (field, email) = blockField(in: rawLine), field == .email,
+                   MailVerificationMatcher.normalizedAddress(email) != nil,
                    let result = try parseMailboxBlock(email: email, lines: lines, nextLine: &nextLine) {
                     credential = result
                 } else {
@@ -110,10 +125,23 @@ enum ImportExportService {
     }
 
     private static func blockField(in line: String) -> (BlockField, String)? {
-        guard let colon = line.firstIndex(of: ":"),
-              let field = BlockField(rawValue: line[..<colon].trimmingCharacters(in: .whitespaces).lowercased())
-        else { return nil }
-        let value = line[line.index(after: colon)...]
+        guard let colon = line.firstIndex(where: { $0 == ":" || $0 == "：" }) else { return nil }
+        var label = line[..<colon].trimmingCharacters(in: .whitespaces)
+        var value = line[line.index(after: colon)...]
+        if ["- ", "* ", "• "].contains(where: { label.hasPrefix($0) }) {
+            label.removeFirst(2)
+        }
+        if label.hasPrefix("**") {
+            label.removeFirst(2)
+            if label.hasSuffix("**") {
+                label.removeLast(2)
+            } else if value.hasPrefix("**") {
+                value = value.dropFirst(2)
+            } else {
+                return nil
+            }
+        }
+        guard let field = BlockField(label: label) else { return nil }
         return (field, String(value.first == " " ? value.dropFirst() : value))
     }
 
@@ -135,7 +163,7 @@ enum ImportExportService {
         nextLine = offset
 
         let login = email.trimmingCharacters(in: .whitespaces)
-        guard !duplicateField, MailVerificationMatcher.normalizedAddress(login) != nil,
+        guard !duplicateField,
               let password = fields[.password], !password.isEmpty,
               let totpSecret = fields[.twoFA]?.trimmingCharacters(in: .whitespaces),
               TOTPService.isValidSecret(totpSecret),
@@ -195,7 +223,7 @@ enum ImportExportService {
         case .ambiguousFormat:
             "Ambiguous separators; choose a separator manually"
         case .invalidMailboxBlock:
-            "Expected Email, Password, 2FA, Mailbox email, and valid HTTPS code URL"
+            "Expected Email, Password, 2FA, Mailbox email, and Mailbox code link with an HTTPS URL"
         default:
             switch separator {
             case .literal("|"): "Expected LOGIN|PASS|2FA"

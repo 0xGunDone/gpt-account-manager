@@ -61,8 +61,10 @@ Email: account+alias@example.com
 Password: example-password
 2FA: JBSWY3DPEHPK3PXP
 Mailbox email: account+alias@example.com
-Ссылка для кода с почты: https://mail.example.com/api/code?key=example
+Mailbox code link: https://mail.example.com/api/code?key=example
 ```
+
+Импорт распознаёт английские и русские метки, например `Login`, «Пароль», `TOTP` и «Ссылка для кода с почты». Можно вставить несколько блоков подряд. Для блоков выбор разделителя не нужен.
 
 При входе в ChatGPT и импорте в CodexAcc приложение сначала выбирает «Продолжить с паролем», если эта кнопка доступна. Когда OpenAI запрашивает код из письма, приложение проверяет адрес на форме и ждёт новый код из API. Поддерживается HTTPS API с JSON `{"success":true,"code":"012345"}` и ответом `{"success":false,"code":"no_code"}`, когда письма ещё нет. Если свежесть кода или адрес подтвердить нельзя, приложение оставляет форму для ручного ввода.
 

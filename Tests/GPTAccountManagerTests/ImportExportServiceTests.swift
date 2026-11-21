@@ -56,19 +56,19 @@ import Testing
         #expect(result.issues == [ImportIssue(lineNumber: 2, message: "Expected LOGIN|PASS|2FA")])
     }
 
-    @Test(arguments: [
+    @Test(arguments: ["Ссылка для кода с почты", "Mailbox code link"], [
         "https://mail.example.test/code?key=fixture",
         "[Получить код](https://mail.example.test/code?key=fixture)",
         "[https://mail.example.test/code?key=fixture](https://mail.example.test/code?key=fixture)",
     ])
-    func labeledImportAcceptsRawAndMarkdownEndpoints(link: String) throws {
+    func labeledImportAcceptsRawAndMarkdownEndpoints(label: String, link: String) throws {
         let result = ImportExportService.parse("""
         Email: One@example.com
         Password:  with:literal|delimiters
         2FA: JBSWY3DPEHPK3PXP
 
         Mailbox email: inbox@example.com
-        Ссылка для кода с почты: \(link)
+        \(label): \(link)
         two@example.com|fixture|KRUGS4ZANFZSAYJA
         """, separator: .automatic)
 
@@ -103,7 +103,42 @@ import Testing
 
         #expect(result.records.map(\.email) == ["valid@example.com"])
         #expect(result.issues == [ImportIssue(
-            lineNumber: 1, message: "Expected Email, Password, 2FA, Mailbox email, and valid HTTPS code URL")])
+            lineNumber: 1, message: "Expected Email, Password, 2FA, Mailbox email, and Mailbox code link with an HTTPS URL")])
+    }
+
+    @Test func detectsMultipleBlocksWithMixedLabelsAndFormatting() {
+        let result = ImportExportService.parse("""
+        Email: one@example.test
+        Password:  exact:password|value
+        2FA: JBSWY3DPEHPK3PXP
+        Mailbox email: inbox@example.test
+        Mailbox code link: https://mail.example.test/code?key=one
+
+        - **Логин:** two@example.test
+        - **Пароль**: **literal**
+        - Ключ 2FA: JBSWY3DPEHPK3PXP
+        - Адрес ящика: inbox+two@example.test
+        - Ссылка для кода с почты: [Код](https://mail.example.test/code?key=two)
+        E-mail： three@example.test
+        Pass: third
+        TOTP secret: JBSWY3DPEHPK3PXP
+        MAILBOX_EMAIL: inbox+three@example.test
+        Mailbox code URL: https://mail.example.test/code?key=three
+        """, separator: .automatic)
+
+        #expect(result.issues.isEmpty)
+        #expect(result.records.map(\.email) == ["one@example.test", "two@example.test", "three@example.test"])
+        #expect(result.records.map(\.password) == [" exact:password|value", "**literal**", "third"])
+        #expect(result.records.compactMap { $0.externalMailbox?.codeURL.query } == ["key=one", "key=two", "key=three"])
+    }
+
+    @Test func preservesLiteralImportsAndLineNumbersWithCRLF() {
+        let result = ImportExportService.parse(
+            "login:one:JBSWY3DPEHPK3PXP\r\npassword:two:JBSWY3DPEHPK3PXP\r\nbroken",
+            separator: .literal(":"))
+
+        #expect(result.records.map(\.email) == ["login", "password"])
+        #expect(result.issues.map(\.lineNumber) == [3])
     }
 
     @Test func invalidTOTPSecretIsRejectedAtImportBoundary() {

@@ -1321,7 +1321,7 @@ private struct DirectTextImportSheet: View {
             Text(filename == nil ? "Добавить аккаунты текстом" : "Импорт аккаунтов из файла")
                 .font(.title3.weight(.semibold))
             if let filename { Text(filename).font(.callout).foregroundStyle(.secondary) }
-            Text("Вставьте строки аккаунтов или блоки с полями Email, Password, 2FA, Mailbox email и «Ссылка для кода с почты».")
+            Text("Вставьте строки аккаунтов или блоки с полями Email, Password, 2FA, Mailbox email и Mailbox code link («Ссылка для кода с почты»).")
                 .foregroundStyle(.secondary)
 
             Picker("Разделитель", selection: $separatorChoice) {
