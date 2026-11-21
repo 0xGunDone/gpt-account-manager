@@ -1,0 +1,15 @@
+.worktrees/
+dist/
+.build/
+.swiftpm/
+*.xcresult
+.DS_Store
+BrowserWorker/node_modules/
+.env
+.env.*
+accounts.json
+accounts.registration-batch.json
+proxies.json
+new-novoreg-access-tokens.txt
+*.app/
+*.dmg

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>SafariSessionExtension</string>
+    <key>CFBundleIdentifier</key>
+    <string>local.wemakecode.gptaccountmanager.SafariSession</string>
+    <key>CFBundleDisplayName</key>
+    <string>GPT Account Manager — Safari Session</string>
+    <key>CFBundleName</key>
+    <string>SafariSessionExtension</string>
+    <key>CFBundlePackageType</key>
+    <string>XPC!</string>
+    <key>CFBundleSupportedPlatforms</key>
+    <array>
+        <string>MacOSX</string>
+    </array>
+    <key>NSExtension</key>
+    <dict>
+        <key>NSExtensionPointIdentifier</key>
+        <string>com.apple.Safari.web-extension</string>
+        <key>NSExtensionPrincipalClass</key>
+        <string>SafariSessionExtension.SafariWebExtensionHandler</string>
+    </dict>
+</dict>
+</plist>

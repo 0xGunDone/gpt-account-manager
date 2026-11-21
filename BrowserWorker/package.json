@@ -1,0 +1,12 @@
+{
+  "name": "gpt-account-manager-browser-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "playwright-core": "1.62.1"
+  }
+}

@@ -1,0 +1,216 @@
+GPT ACCOUNT MANAGER
+English user guide
+
+WHAT THE APP DOES
+
+GPT Account Manager keeps a local list of ChatGPT accounts, checks the current
+subscription and expiration date, and can rotate the authenticator (2FA) secret.
+Before ordinary actions, the app checks the saved account session and signs in
+only when it is absent or expired. Successful fresh password/2FA verification
+saves the verified login for subsequent actions. Automatic logout-all is disabled.
+
+Use this application only with accounts that you own or are authorized to
+manage.
+
+SYSTEM REQUIREMENTS
+
+- macOS 14 or later
+- Git, Swift 6 (Xcode 16 or a compatible Command Line Tools installation)
+- Node.js 20 or later with npm
+
+INSTALLATION AND UPDATES
+
+    git clone https://github.com/0xGunDone/gpt-account-manager.git
+    cd gpt-account-manager
+    ./run.sh
+
+Use ./run.sh for future starts to check the configured Git upstream before
+building and opening the app. The launcher applies only fast-forward updates.
+If the checkout has local changes or the upstream is unavailable, it explains
+what happened and runs the local code. See the README for password configuration
+and the Safari extension.
+
+MAIN WINDOW
+
+- Left sidebar: account groups and individual accounts.
+- Sidebar search: filters saved accounts by login or tag. Passwords and 2FA
+  secrets are never included in search.
+- Right panel: details and actions for the selected account.
+- Top toolbar:
+  - Import: import a text file with accounts.
+  - Add by text: paste accounts directly into the app.
+  - Export: export the current account list.
+  - Check all: check all accounts.
+- Bottom-left plus button: create a new group.
+
+ADDING ACCOUNTS
+
+Choose “Add by text” and enter one account per line in this exact format:
+
+LOGIN|PASSWORD|2FA_SECRET
+
+Example format only:
+person@example.com|your-password|JBSWY3DPEHPK3PXP
+
+The 2FA secret must be the Base32 secret used by an authenticator app. Do not
+include spaces or the QR image itself. The app validates every line and reports
+invalid or duplicate accounts before importing.
+
+IMPORTANT SECURITY NOTE
+
+The app stores login, password, and 2FA values locally without encryption in
+the app's accounts.json file. Protect the Mac user account and do not send this
+file or exported account lists to anyone who should not have full access.
+
+WORKING WITH GROUPS
+
+1. Click the plus button in the lower-left corner to create a group.
+2. Select accounts in the sidebar:
+   - click one account;
+   - Command-click to add or remove individual accounts;
+   - Shift-click to select a range.
+3. Drag any selected account row onto a group.
+4. Confirm the move when the app asks.
+5. Select a group to view its accounts.
+6. Use “Copy all” in the group view to copy all accounts as separate
+   LOGIN|PASSWORD|2FA lines.
+
+The “Without group” section contains accounts that are not assigned to a
+group.
+
+CHECKING AN ACCOUNT
+
+1. Select an account in the left sidebar.
+2. Click “Check” in the right panel.
+3. The embedded ChatGPT browser opens and signs in.
+4. The app reads the subscription plan and exact subscription date through an
+   authenticated request in the account's session. The current-plan card is a
+   fallback when the service does not return a date.
+5. The result appears in the account details and next to the account in the
+   sidebar.
+6. The checked browser session stays open in the account view so you can
+   inspect ChatGPT or perform a manual follow-up. Each account retains its own
+   session when you check another account.
+
+For the most reliable result, check accounts one at a time. If ChatGPT asks
+for a manual action, use the browser panel and then press “Continue”. Do not
+close the embedded browser while an operation is running.
+
+CHANGING THE 2FA SECRET
+
+1. Select one account.
+2. Click “Change 2FA”.
+3. Confirm the operation.
+4. The app signs in, opens the security settings, disables the old
+   authenticator, and enables a new one.
+5. If ChatGPT displays “Problems scanning?” or asks for a one-time code,
+   follow the instruction in the embedded browser and press “Continue” when
+   ready.
+6. The app verifies the new 2FA secret and reads the subscription information.
+7. The app saves the verified login in the account's persistent browser profile.
+8. Only after verification and session saving will the account be marked “2FA: ready”.
+
+If the process pauses, use the visible “Continue” or “Continue 2FA change”
+button. After a CAPTCHA or another manual step, Continue resumes the exact
+currently open browser tab and its session. It does not replace that tab with a
+new login. A new isolated login is created only when clean verification starts
+for the first time or when the existing page cannot provide the required proof.
+The account remains in a recoverable state; do not start a second operation for
+the same account while one is paused.
+
+SAFE RECOVERY AFTER THE OLD 2FA IS DISABLED
+
+The app saves a recovery checkpoint immediately after ChatGPT confirms that
+the old authenticator has been disabled. From that point onward, it will never
+try the old 2FA secret in a new login. It can continue automatic setup only in
+the same still-authenticated browser session in which the old method was
+disabled.
+
+- Always use “Continue 2FA change” for an account that shows a recovery stage;
+  do not click “Change 2FA” again.
+- Keep the original embedded browser session open until the new authenticator
+  has been confirmed.
+- If you finish connecting the new authenticator manually before the app can
+  capture its secret, use the “New 2FA already connected manually?” field in
+  the account view. Paste the new Base32 secret and choose “Save and verify”.
+  The app keeps the old stored secret until a clean login proves the new one.
+- If the app was restarted, the browser session was closed, or ChatGPT asks for
+  a fresh login after the old method was disabled, automatic recovery stops on
+  purpose. Recover the account through the owner's email or OpenAI support,
+  then finish setting up 2FA manually.
+- Never delete an account record while its 2FA change is paused. The record may
+  contain the pending authenticator secret needed for recovery.
+
+GROUP 2FA ROTATION
+
+Select a group and choose Change access. Accounts run strictly one at a time.
+The next account starts only after the current operation finishes successfully.
+A failure, CAPTCHA, or manual step pauses the entire queue and keeps the current
+account selected. Continue resumes that account in its retained browser session,
+then proceeds through the remaining accounts in order. Stop cancels the waiting
+queue without clearing saved recovery checkpoints. Starting a new group change
+skips accounts with a saved recovery stage; resume those accounts individually.
+
+ACCOUNT STATUS LABELS
+
+- Not checked: the account has not been verified yet.
+- Checking: a check is in progress.
+- 2FA: queue: waiting in the 2FA queue.
+- 2FA: change: the 2FA rotation is running.
+- 2FA: manual: a browser action is required.
+- Old 2FA disabled: automatic recovery can continue only in the original open
+  browser session.
+- New 2FA prepared: confirm the pending secret in the original open session.
+- New 2FA enabled: fresh-login verification and saving the session remain.
+- 2FA: ready: rotation, clean-login verification, and saved-session update completed.
+- 2FA: error: the operation needs attention.
+- 2FA recovery required: the account needs the current or pending 2FA secret
+  copied from the account view.
+
+COPYING ACCOUNT DATA
+
+- “Copy LOGIN|PASS|2FA” copies one complete account line.
+- The live six-digit code beside the editable LOGIN|PASS|2FA line refreshes
+  automatically. Click it to copy the code. During a pending rotation it uses
+  the new pending secret and is highlighted in orange.
+- “Copy current 2FA” copies the current authenticator secret when recovery is
+  required.
+- “Copy pending 2FA” copies the new secret that is waiting to be confirmed.
+- A group’s “Copy all” copies every account in that group, one per line.
+
+TROUBLESHOOTING
+
+- If the browser shows an error, wait a few seconds and use “Try again”.
+- If an operation is paused, use the matching Continue button instead of
+  starting it again.
+- Continue after a CAPTCHA uses the currently displayed browser tab. Keep that
+  tab open until the operation finishes.
+- If the app reports that a code must be entered manually, enter the current
+  one-time code in the embedded browser and continue.
+- If an account is marked as needing 2FA recovery, copy the current or pending
+  secret from the account view and finish the recovery in ChatGPT.
+- If the old authenticator is already disabled and the original session is no
+  longer available, do not retry with the old secret. Use owner-email or
+  OpenAI-supported account recovery.
+- Never run two operations for the same account at the same time.
+
+STALLED BROWSER RECOVERY
+
+If Login or Security stops showing the required controls, wait until the
+operation enters manual mode. Reload Page and Reopen Section keep the current
+session. New Login creates a separate session. After the old authenticator may
+have been disabled, the app will not submit the old authenticator code
+automatically. At Awaiting Clean Login, it restarts only verification with the
+pending authenticator secret. Until the new session proves the selected
+account's identity, Return to Original Session keeps the original available.
+Recovery navigation temporarily blocks other operation starts.
+Stop is also available while an operation is paused. It releases the queue
+without deleting any saved recovery stage or pending authenticator secret.
+
+
+External login links and callback URLs
+The login field accepts full HTTP/HTTPS links. Keep “Return to application” for the existing automatic callback. Choose “Copy callback” to capture the OAuth return URL without opening its destination. The editable address bar above the browser supports Go and Copy URL; failed localhost callbacks remain available to copy.
+
+Change access
+The account and group action offers Password, 2FA, or Password and 2FA. The target password is @subzavozbot. Combined mode verifies the new password first, then runs the existing 2FA rotation. Password-only leaves the authenticator unchanged. The previous password remains primary until a fresh login verifies the new password and account identity.
+OpenAI may require an email verification code to change a password. Without mailbox access this step cannot be completed. Stop before submitting a new password to return to the 2FA-only option. A submitted candidate remains saved for recovery. Use “Password already changed manually — verify” after a manual password change.

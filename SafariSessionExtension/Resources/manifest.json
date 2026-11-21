@@ -1,0 +1,15 @@
+{
+  "manifest_version": 2,
+  "name": "GPT Account Manager",
+  "version": "1.1.0",
+  "description": "Открывает настройки безопасности ChatGPT в обычном окне Safari.",
+  "permissions": ["nativeMessaging", "scripting", "https://chatgpt.com/*"],
+  "background": {
+    "scripts": ["background.js"],
+    "persistent": true
+  },
+  "browser_action": {
+    "default_title": "GPT Account Manager",
+    "default_popup": "status.html"
+  }
+}
