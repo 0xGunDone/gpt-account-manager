@@ -358,7 +358,7 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
         case failure(String)
     }
 
-    private enum ReauthenticationResult {
+    enum ReauthenticationResult {
         case ready
         case manual(String)
         case cancelled
@@ -1327,11 +1327,13 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
             return promoteRecoveryCandidate(candidate, snapshot: snapshot, account: account)
         }
 
+        defer { candidate.setOperationMessage(nil) }
         switch await signIn(
             account: account,
             secret: account.totpSecret,
             in: candidate,
-            automaticallySubmitOTP: false)
+            automaticallySubmitOTP: false,
+            waitForManualFactor: true)
         {
         case .success(let snapshot, _):
             return promoteRecoveryCandidate(candidate, snapshot: snapshot, account: account)
@@ -1514,60 +1516,17 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
             return .failure(stage: .oldMethodDisabled, message: "Stopped")
         }
         var working = account
-        switch await probeRecoverySession(account: working, in: session) {
-        case .authenticated:
-            break
-        case .manual(let message):
-            return .manualActionRequired(stage: .oldMethodDisabled, message: message)
-        case .cancelled:
-            return .failure(stage: .oldMethodDisabled, message: "Stopped")
+        if let blocked = await prepareRotationEnrollmentResume(account: working, in: session) {
+            return blocked
         }
-        guard await openSecuritySettings(in: session, seconds: 30) else {
+        if session.webView.url?.host?.lowercased() == "chatgpt.com",
+           !TrustedChatGPTOrigin.allowsSecurityAutomation(session.webView.url),
+           !(await openSecuritySettings(in: session, seconds: 30)) {
             return .manualActionRequired(
                 stage: .oldMethodDisabled,
-                message: "Open Security settings in the original authenticated browser session and continue.")
+                message: "Откройте настройки безопасности в подтверждённой сессии аккаунта.")
         }
-
-        do {
-            switch try await authenticatorSwitch(click: false, in: session) {
-            case .off:
-                try markOldMethodDisabled(in: &working, onCheckpoint: onCheckpoint)
-                return await beginNewSetup(
-                    account: &working,
-                    in: session,
-                    onCheckpoint: onCheckpoint)
-            case .on:
-                return .manualActionRequired(
-                    stage: .oldMethodDisabled,
-                    message: "The browser reports that the old authenticator is enabled again. Verify the account manually.")
-            case .notFound:
-                let enable = try await clickUniqueControl(
-                    labels: enableLabels,
-                    click: false,
-                    in: session)
-                guard enable == .found else {
-                    return .manualActionRequired(
-                        stage: .oldMethodDisabled,
-                        message: "The disabled authenticator state could not be verified uniquely.")
-                }
-                try markOldMethodDisabled(in: &working, onCheckpoint: onCheckpoint)
-                return await beginNewSetup(
-                    account: &working,
-                    in: session,
-                    onCheckpoint: onCheckpoint)
-            case .ambiguous, .clicked:
-                return .manualActionRequired(
-                    stage: .oldMethodDisabled,
-                    message: "The authenticator switch could not be identified uniquely.")
-            }
-        } catch {
-            if operationIsCancelled {
-                return .failure(stage: .oldMethodDisabled, message: "Stopped")
-            }
-            return .manualActionRequired(
-                stage: .oldMethodDisabled,
-                message: "Verify the disabled authenticator state in the original browser session and continue.")
-        }
+        return await beginNewSetup(account: &working, in: session, onCheckpoint: onCheckpoint)
     }
 
     private func markOldMethodDisabled(
@@ -1735,9 +1694,11 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
         humanChallengeTimeoutSeconds: Int = 300,
         beforeSetup: (@MainActor (BrowserSession) async throws -> Bool)? = nil,
         reauthenticationHandler: (@MainActor (BrowserSession) async throws -> Bool)? = nil,
+        rotationMail: ExternalLoginMailRequest? = nil,
+        rotationReauthentication: (@MainActor () async -> ReauthenticationResult)? = nil,
         onSecret: @MainActor (String) throws -> Void
     ) async -> RegistrationMFAResult {
-        cancellationRequested = false
+        if rotationReauthentication == nil { cancellationRequested = false }
         let generation = session.cancellationGeneration
         let clock = ContinuousClock()
         var limit = clock.now.advanced(by: .seconds(transitionTimeoutSeconds + humanChallengeTimeoutSeconds))
@@ -1761,12 +1722,27 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
             guard !operationIsCancelled, generation == session.cancellationGeneration else {
                 return .failure("Подключение 2FA остановлено.")
             }
+            if rotationReauthentication != nil, session.webView.isLoading {
+                try? await Task.sleep(for: .milliseconds(200))
+                continue
+            }
             guard TrustedChatGPTOrigin.allowsAuthentication(session.webView.url) else {
                 return .manual("Откройте настройки безопасности ChatGPT и продолжите подключение 2FA.")
             }
             do {
                 let challenge = try await hasSecurityChallenge(in: session)
                 let reauthentication = session.webView.url?.host?.lowercased() == "auth.openai.com"
+                if reauthentication, !challenge, let rotationReauthentication {
+                    switch await rotationReauthentication() {
+                    case .ready:
+                        setupStarted = true
+                        limit = clock.now.advanced(by: .seconds(transitionTimeoutSeconds + humanChallengeTimeoutSeconds))
+                        deadline = clock.now.advanced(by: .seconds(transitionTimeoutSeconds))
+                        continue
+                    case .manual(let message): return .manual(message)
+                    case .cancelled: return .failure("Подключение 2FA остановлено.")
+                    }
+                }
                 if reauthentication, !challenge, let reauthenticationHandler {
                     let state = try await RegistrationForm.inspect(in: session)
                     if state.kind == .emailCode, let pageURL = state.pageURL, pageURL == session.webView.url {
@@ -1815,7 +1791,23 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                     deadline = min(limit, clock.now.advanced(by: .seconds(transitionTimeoutSeconds)))
                 }
                 if TrustedChatGPTOrigin.allowsSecurityAutomation(session.webView.url) {
-                    let introduction = try await AuthenticatorSetupIntroduction.advance(in: session, click: !introductionAdvanced && secret == nil)
+                    let canAdvance = !introductionAdvanced && secret == nil
+                    let introduction: ControlResult
+                    if let rotationMail, canAdvance {
+                        let probe = try await AuthenticatorSetupIntroduction.advance(in: session, click: false)
+                        if probe == .found {
+                            introduction = try await ExternalLoginMailRequest.performTrigger(
+                                request: rotationMail, in: session, from: session.webView.url,
+                                skipped: .notFound, wasSubmitted: { $0 == .clicked }
+                            ) {
+                                try await AuthenticatorSetupIntroduction.advance(in: session)
+                            }
+                        } else {
+                            introduction = probe
+                        }
+                    } else {
+                        introduction = try await AuthenticatorSetupIntroduction.advance(in: session, click: canAdvance)
+                    }
                     switch introduction {
                     case .clicked:
                         introductionAdvanced = true
@@ -1872,7 +1864,12 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                         guard !operationIsCancelled, generation == session.cancellationGeneration else {
                             return .failure("Подключение 2FA остановлено.")
                         }
-                        let started = try await startAuthenticatorSetup(in: session)
+                        let started = try await ExternalLoginMailRequest.performTrigger(
+                            request: rotationMail, in: session, from: session.webView.url,
+                            skipped: .notFound, wasSubmitted: { $0 == .clicked }
+                        ) {
+                            try await startAuthenticatorSetup(in: session)
+                        }
                         if started == .ambiguous {
                             return .manual("Форма подключения 2FA неоднозначна. Проверьте её в браузере.")
                         }
@@ -2050,6 +2047,25 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
         return result.flatMap(ControlResult.init(rawValue:)) ?? .notFound
     }
 
+    private func prepareRotationEnrollmentResume(
+        account: AccountRecord,
+        in session: BrowserSession
+    ) async -> TwoFARotationOutcome? {
+        if rotationSessions[account.id] === session,
+           rotationRecoverySessionState(for: account) == .authenticated,
+           TrustedChatGPTOrigin.allowsAuthentication(session.webView.url),
+           session.webView.url?.host?.lowercased() == "auth.openai.com" {
+            // A challenge in the original browser belongs to the saved setup.
+            // The shared enrollment loop verifies the account on return.
+            return nil
+        }
+        switch await probeRecoverySession(account: account, in: session) {
+        case .authenticated: return nil
+        case .manual(let message): return .manualActionRequired(stage: account.rotationStage, message: message)
+        case .cancelled: return .failure(stage: account.rotationStage, message: "Stopped")
+        }
+    }
+
     private func beginNewSetup(
         account: inout AccountRecord,
         in session: BrowserSession,
@@ -2058,49 +2074,51 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
         if operationIsCancelled {
             return .failure(stage: account.rotationStage, message: "Stopped")
         }
-        do {
-            let externalMail = externalLoginMail(for: account, in: session)
-            let enable = try await ExternalLoginMailRequest.performTrigger(
-                request: externalMail, in: session, from: session.webView.url,
-                skipped: .notFound, wasSubmitted: { $0 == .clicked }
-            ) {
-                try await startAuthenticatorSetup(in: session)
+        let original = account
+        let generation = session.cancellationGeneration
+        let externalMail = externalLoginMail(for: original, in: session)
+        session.setOperationMessage("Подключение нового 2FA…")
+        let outcome = await enrollNewAuthenticator(
+            in: session,
+            pendingSecret: original.pendingTOTPSecret,
+            automaticallyWaitForTransitions: true,
+            rotationMail: externalMail,
+            rotationReauthentication: {
+                await self.completeSecurityReauthentication(
+                    account: original, in: session, externalMail: externalMail, allowAutomaticOldCode: false)
             }
-            guard enable == .clicked else {
-                return .manualActionRequired(
-                    stage: account.rotationStage,
-                    message: "Start authenticator setup in the browser, then continue.")
+        ) { secret in
+            guard TOTPService.normalizedSecret(secret) != TOTPService.normalizedSecret(original.totpSecret) else {
+                throw RotationVerificationError.identityOrSecretMissing
             }
-            await waitAfterSubmission(in: session)
-
-            if session.webView.url?.host?.lowercased() == "auth.openai.com" {
-                switch await completeSecurityReauthentication(
-                    account: account, in: session, externalMail: externalMail, allowAutomaticOldCode: false
-                ) {
-                case .ready: break
-                case .manual(let message): return .manualActionRequired(stage: account.rotationStage, message: message)
-                case .cancelled: return .failure(stage: account.rotationStage, message: "Stopped")
-                }
-            }
-            guard TrustedChatGPTOrigin.allowsSecurityAutomation(session.webView.url) else {
-                return .manualActionRequired(
-                    stage: account.rotationStage,
-                    message: "Return to ChatGPT Security settings and continue.")
-            }
-            let secret = try await captureNewSecret(in: session)
             try onCheckpoint(.secretCaptured(secret))
             RotationState.capture(secret: secret, in: &account)
-            return await submitPendingSetup(
-                account: &account,
-                in: session,
-                onCheckpoint: onCheckpoint)
-        } catch {
-            if operationIsCancelled {
-                return .failure(stage: account.rotationStage, message: "Stopped")
+        }
+        session.setOperationMessage(nil)
+        guard !operationIsCancelled, generation == session.cancellationGeneration else {
+            return .failure(stage: account.rotationStage, message: "Stopped")
+        }
+        switch outcome {
+        case .manual(let message):
+            return .manualActionRequired(stage: account.rotationStage, message: message)
+        case .failure(let message):
+            return .failure(stage: account.rotationStage, message: message)
+        case .enabled(let secret):
+            guard account.pendingTOTPSecret.map(TOTPService.normalizedSecret) == TOTPService.normalizedSecret(secret) else {
+                return .failure(stage: account.rotationStage, message: "Подтверждённый ключ 2FA не совпадает с сохранённым.")
             }
-            return .manualActionRequired(
-                stage: account.rotationStage,
-                message: "Show the new authenticator QR code in the browser, then continue.")
+            do {
+                guard try await hasAuthenticatedSession(for: account, in: session) else {
+                    return .manualActionRequired(stage: account.rotationStage, message: "Сессия аккаунта не подтверждена. Войдите в нужный аккаунт.")
+                }
+                try Task.checkCancellation()
+                guard !operationIsCancelled, generation == session.cancellationGeneration else { throw CancellationError() }
+                try onCheckpoint(.setupConfirmed)
+                RotationState.markSetupConfirmed(in: &account)
+                return await performCleanLogin(account: account, in: session)
+            } catch {
+                return .failure(stage: account.rotationStage, message: "Не удалось сохранить подтверждённый этап подключения 2FA.")
+            }
         }
     }
 
@@ -2109,156 +2127,14 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
         in session: BrowserSession,
         onCheckpoint: @escaping @MainActor (RotationCheckpointEvent) throws -> Void
     ) async -> TwoFARotationOutcome {
-        if operationIsCancelled {
-            return .failure(stage: .pendingSecretCaptured, message: "Stopped")
-        }
         var working = account
         guard working.pendingTOTPSecret != nil else {
-            return .failure(
-                stage: .pendingSecretCaptured,
-                message: "Pending authenticator secret is missing.")
+            return .failure(stage: .pendingSecretCaptured, message: "Ожидающий ключ 2FA отсутствует.")
         }
-
-        switch await probeRecoverySession(account: working, in: session) {
-        case .authenticated:
-            break
-        case .manual(let message):
-            return .manualActionRequired(stage: .pendingSecretCaptured, message: message)
-        case .cancelled:
-            return .failure(stage: .pendingSecretCaptured, message: "Stopped")
+        if let blocked = await prepareRotationEnrollmentResume(account: working, in: session) {
+            return blocked
         }
-
-        if await waitForAuthenticatorSetupCompletion(in: session, seconds: 5)
-        {
-            if operationIsCancelled {
-                return .failure(stage: .pendingSecretCaptured, message: "Stopped")
-            }
-            do {
-                try onCheckpoint(.setupConfirmed)
-                RotationState.markSetupConfirmed(in: &working)
-                return await performCleanLogin(account: working, in: session)
-            } catch {
-                return .failure(
-                    stage: .pendingSecretCaptured,
-                    message: "Could not save confirmed authenticator state.")
-            }
-        }
-
-        do {
-            switch try await AuthenticatorSetupIntroduction.codeStep(in: session) {
-            case .found:
-                return await submitPendingSetup(account: &working, in: session, onCheckpoint: onCheckpoint)
-            case .ambiguous, .clicked:
-                return .manualActionRequired(stage: .pendingSecretCaptured,
-                                             message: "The pending authenticator code step is ambiguous. Continue manually.")
-            case .notFound: break
-            }
-            let field = try await visibleFieldState(selectors: otpSelectors, in: session)
-            if field == .notFound {
-                let enable = try await startAuthenticatorSetup(in: session)
-                guard enable == .clicked else {
-                    return .manualActionRequired(
-                        stage: .pendingSecretCaptured,
-                        message: "Return to the QR-code setup step and continue.")
-                }
-                await waitAfterSubmission(in: session)
-                guard TrustedChatGPTOrigin.allowsSecurityAutomation(session.webView.url) else {
-                    return .manualActionRequired(
-                        stage: .pendingSecretCaptured,
-                        message: "Return to ChatGPT Security settings and continue.")
-                }
-                let refreshedSecret = try await captureNewSecret(in: session)
-                try onCheckpoint(.secretCaptured(refreshedSecret))
-                RotationState.capture(secret: refreshedSecret, in: &working)
-            } else if field == .ambiguous {
-                return .manualActionRequired(
-                    stage: .pendingSecretCaptured,
-                    message: "More than one 2FA field is visible. Continue manually.")
-            }
-
-            return await submitPendingSetup(
-                account: &working,
-                in: session,
-                onCheckpoint: onCheckpoint)
-        } catch {
-            if operationIsCancelled {
-                return .failure(stage: .pendingSecretCaptured, message: "Stopped")
-            }
-            return .manualActionRequired(
-                stage: .pendingSecretCaptured,
-                message: "Restore the pending authenticator setup in the browser, then continue.")
-        }
-    }
-
-    private func submitPendingSetup(
-        account: inout AccountRecord,
-        in session: BrowserSession,
-        onCheckpoint: @escaping @MainActor (RotationCheckpointEvent) throws -> Void
-    ) async -> TwoFARotationOutcome {
-        if operationIsCancelled {
-            return .failure(stage: account.rotationStage, message: "Stopped")
-        }
-        guard let pending = account.pendingTOTPSecret else {
-            return .failure(stage: account.rotationStage, message: "Pending authenticator secret is missing.")
-        }
-
-        do {
-            if try await AuthenticatorSetupIntroduction.advanceQRCode(in: session) == .clicked {
-                await waitAfterSubmission(in: session)
-            }
-            let codePageURL = session.webView.url
-            let generation = session.cancellationGeneration
-            let delay = TOTPService.safeSubmissionDelay(minimumRemaining: 10)
-            if delay > 0 { try await Task.sleep(for: .seconds(delay + 0.15)) }
-            guard !operationIsCancelled, generation == session.cancellationGeneration,
-                  session.webView.url == codePageURL else { throw CancellationError() }
-            let code = try TOTPService.code(secret: pending)
-            let otp = try await submitAuthenticatorSetupCode(code, in: session)
-            guard otp == .submitted else {
-                return .manualActionRequired(
-                    stage: .pendingSecretCaptured,
-                    message: "Submit the code for the pending authenticator, then continue.")
-            }
-            await waitAfterSubmission(in: session)
-            if operationIsCancelled {
-                return .failure(stage: account.rotationStage, message: "Stopped")
-            }
-
-            if await authenticatorSetupDialogIsVisible(in: session) == true,
-               try await AuthenticatorSetupIntroduction.codeStep(in: session) == .notFound,
-               try await visibleFieldState(selectors: otpSelectors, in: session) == .notFound {
-                let confirm = try await clickUniqueControl(
-                    labels: confirmLabels,
-                    click: true,
-                    in: session)
-                if confirm == .clicked {
-                    await waitAfterSubmission(in: session)
-                }
-            }
-
-            guard await waitForAuthenticatorSetupCompletion(in: session, seconds: 10) else {
-                if operationIsCancelled {
-                    return .failure(stage: account.rotationStage, message: "Stopped")
-                }
-                return .manualActionRequired(
-                    stage: .pendingSecretCaptured,
-                    message: "Confirm that the authenticator is enabled, then continue.")
-            }
-            if operationIsCancelled {
-                return .failure(stage: account.rotationStage, message: "Stopped")
-            }
-
-            try onCheckpoint(.setupConfirmed)
-            RotationState.markSetupConfirmed(in: &account)
-            return await performCleanLogin(account: account, in: session)
-        } catch {
-            if operationIsCancelled {
-                return .failure(stage: account.rotationStage, message: "Stopped")
-            }
-            return .manualActionRequired(
-                stage: account.rotationStage,
-                message: "Complete authenticator setup in the browser, then continue.")
-        }
+        return await beginNewSetup(account: &working, in: session, onCheckpoint: onCheckpoint)
     }
 
     private func performCleanLogin(
@@ -2296,7 +2172,8 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
             secret: pending,
             in: session,
             initialProof: initialProof,
-            requireExplicitProof: true
+            requireExplicitProof: true,
+            automaticallyWaitForTransitions: true
         ) {
         case .success(let snapshot, let proof):
             if operationIsCancelled {
@@ -2803,6 +2680,7 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
         requireExplicitProof: Bool = false,
         immediateAuthenticationWaitSeconds: Int = ChatGPTAutomation.cleanLoginAuthenticationWaitSeconds,
         automaticallySubmitOTP: Bool = true,
+        waitForManualFactor: Bool = false,
         loginTimeoutSeconds: Int = 60,
         automaticallyWaitForTransitions: Bool = false,
         continueWaitingOnTimeout: Bool = false,
@@ -2812,13 +2690,14 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
         emailCodeHandler: (@MainActor (BrowserSession) async throws -> Bool)? = nil
     ) async -> SignInResult {
         let externalMail = emailCodeHandler == nil ? externalLoginMail(for: account, in: session) : nil
-        let automaticallyWaitForTransitions = automaticallyWaitForTransitions || externalMail != nil
+        let automaticallyWaitForTransitions = automaticallyWaitForTransitions || externalMail != nil || waitForManualFactor
         let clock = ContinuousClock()
         var deadline = clock.now.advanced(by: .seconds(loginTimeoutSeconds))
         var limit = clock.now.advanced(by: .seconds(loginTimeoutSeconds + humanChallengeTimeoutSeconds))
         let continuousWait = automaticallyWaitForTransitions && continueWaitingOnTimeout
         let generation = session.cancellationGeneration
         var waitingForHuman = false
+        var waitingForManualFactor = false
         let passwordLoginRequest = passwordEmailRequests[ObjectIdentifier(session)]
         var submittedStages = passwordLoginRequest?.submittedLoginStages ?? []
         var preparedPasswordStages: Set<String> = []
@@ -3201,6 +3080,16 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
 
                 guard automaticallySubmitOTP else {
                     session.setVisible(true)
+                    if waitForManualFactor {
+                        if !waitingForManualFactor,
+                           pageURL?.host?.lowercased() == "auth.openai.com", path.hasPrefix("/mfa-challenge/") {
+                            waitingForManualFactor = true
+                            deadline = min(limit, clock.now.advanced(by: .seconds(humanChallengeTimeoutSeconds)))
+                            session.setOperationMessage("Подтвердите вход в браузере. Смена 2FA продолжится автоматически.")
+                        }
+                        try await Task.sleep(for: .milliseconds(250))
+                        continue
+                    }
                     return .manual(
                         "Введите действующий одноразовый код вручную и нажмите «Продолжить».",
                         proof)
