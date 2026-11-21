@@ -1203,11 +1203,18 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
 
                 switch try await authenticatorSwitch(click: false, in: session) {
                 case .on:
-                    try onCheckpoint(.removalStarted)
-                    RotationState.markRemovalStarted(in: &working)
-                    guard try await authenticatorSwitch(click: true, in: session) == .clicked else {
+                    let externalMail = externalLoginMail(for: working, in: session)
+                    let toggle = try await ExternalLoginMailRequest.performTrigger(
+                        request: externalMail, in: session, from: session.webView.url,
+                        skipped: .notFound, wasSubmitted: { $0 == .clicked }
+                    ) {
+                        try onCheckpoint(.removalStarted)
+                        RotationState.markRemovalStarted(in: &working)
+                        return try await authenticatorSwitch(click: true, in: session, expectedState: .on)
+                    }
+                    guard toggle == .clicked else {
                         return .manualActionRequired(
-                            stage: .removingOldMethod,
+                            stage: working.rotationStage,
                             message: "The authenticator switch changed. Continue manually.")
                     }
                     await waitAfterSubmission(in: session)
@@ -1215,6 +1222,7 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                         account: &working,
                         in: session,
                         allowAutomaticOldCode: true,
+                        externalMail: externalMail,
                         onCheckpoint: onCheckpoint)
                 case .off:
                     try markOldMethodDisabled(
@@ -1343,6 +1351,18 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
             return .failure(stage: .removingOldMethod, message: "Stopped")
         }
         var working = account
+        let externalMail = externalLoginMail(for: working, in: session)
+        if session.webView.url?.host?.lowercased() == "auth.openai.com",
+           rotationSessions[account.id] === session,
+           rotationRecoverySessionState(for: account) == .authenticated {
+            switch await completeSecurityReauthentication(
+                account: account, in: session, externalMail: externalMail, allowAutomaticOldCode: false
+            ) {
+            case .ready: break
+            case .manual(let message): return .manualActionRequired(stage: .removingOldMethod, message: message)
+            case .cancelled: return .failure(stage: .removingOldMethod, message: "Stopped")
+            }
+        }
         switch await probeRecoverySession(account: working, in: session) {
         case .authenticated:
             break
@@ -1404,7 +1424,13 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                         stage: .removingOldMethod,
                         message: "The original authenticated browser session is unavailable.")
                 }
-                guard try await authenticatorSwitch(click: true, in: session) == .clicked else {
+                let toggle = try await ExternalLoginMailRequest.performTrigger(
+                    request: externalMail, in: session, from: session.webView.url,
+                    skipped: .notFound, wasSubmitted: { $0 == .clicked }
+                ) {
+                    try await authenticatorSwitch(click: true, in: session, expectedState: .on)
+                }
+                guard toggle == .clicked else {
                     return .manualActionRequired(
                         stage: .removingOldMethod,
                         message: "The authenticator switch changed. Continue manually.")
@@ -1414,6 +1440,7 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                     account: &working,
                     in: session,
                     allowAutomaticOldCode: false,
+                    externalMail: externalMail,
                     onCheckpoint: onCheckpoint)
             case .ambiguous, .clicked:
                 return .manualActionRequired(
@@ -1556,6 +1583,7 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
         account: inout AccountRecord,
         in session: BrowserSession,
         allowAutomaticOldCode: Bool,
+        externalMail: ExternalLoginMailRequest? = nil,
         onCheckpoint: @escaping @MainActor (RotationCheckpointEvent) throws -> Void
     ) async -> TwoFARotationOutcome {
         if operationIsCancelled {
@@ -1563,15 +1591,11 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
         }
         do {
             if session.webView.url?.host?.lowercased() == "auth.openai.com" {
-                guard allowAutomaticOldCode else {
-                    return .manualActionRequired(
-                        stage: .removingOldMethod,
-                        message: "OpenAI is asking for identity confirmation again. Complete it manually in this same browser session, then continue.")
-                }
-                switch await completeRemovalReauthentication(
+                switch await completeSecurityReauthentication(
                     account: account,
                     in: session,
-                    allowAutomaticOldCode: true
+                    externalMail: externalMail,
+                    allowAutomaticOldCode: allowAutomaticOldCode
                 ) {
                 case .ready:
                     break
@@ -2035,7 +2059,13 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
             return .failure(stage: account.rotationStage, message: "Stopped")
         }
         do {
-            let enable = try await startAuthenticatorSetup(in: session)
+            let externalMail = externalLoginMail(for: account, in: session)
+            let enable = try await ExternalLoginMailRequest.performTrigger(
+                request: externalMail, in: session, from: session.webView.url,
+                skipped: .notFound, wasSubmitted: { $0 == .clicked }
+            ) {
+                try await startAuthenticatorSetup(in: session)
+            }
             guard enable == .clicked else {
                 return .manualActionRequired(
                     stage: account.rotationStage,
@@ -2043,6 +2073,15 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
             }
             await waitAfterSubmission(in: session)
 
+            if session.webView.url?.host?.lowercased() == "auth.openai.com" {
+                switch await completeSecurityReauthentication(
+                    account: account, in: session, externalMail: externalMail, allowAutomaticOldCode: false
+                ) {
+                case .ready: break
+                case .manual(let message): return .manualActionRequired(stage: account.rotationStage, message: message)
+                case .cancelled: return .failure(stage: account.rotationStage, message: "Stopped")
+                }
+            }
             guard TrustedChatGPTOrigin.allowsSecurityAutomation(session.webView.url) else {
                 return .manualActionRequired(
                     stage: account.rotationStage,
@@ -2323,58 +2362,122 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
         }
     }
 
-    private func completeRemovalReauthentication(
+    private func completeSecurityReauthentication(
         account: AccountRecord,
         in session: BrowserSession,
+        externalMail: ExternalLoginMailRequest?,
         allowAutomaticOldCode: Bool
     ) async -> ReauthenticationResult {
-        guard allowAutomaticOldCode else {
-            return .manual(
-                "Complete OpenAI identity confirmation manually in this same browser session.")
-        }
+        let generation = session.cancellationGeneration
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(30))
+        var deadline = clock.now.advanced(by: .seconds(30))
+        var chosePassword = false
+        var submittedPassword = false
+        var submittedMail = false
+        var submittedOTP = false
 
         while clock.now < deadline {
-            if operationIsCancelled { return .cancelled }
-            if TrustedChatGPTOrigin.allowsSecurityAutomation(session.webView.url) {
-                return .ready
+            guard !operationIsCancelled, generation == session.cancellationGeneration else { return .cancelled }
+            if session.webView.isLoading {
+                try? await Task.sleep(for: .milliseconds(250))
+                continue
             }
-            guard TrustedChatGPTOrigin.allowsAuthentication(session.webView.url) else {
+            guard let pageURL = session.webView.url, TrustedChatGPTOrigin.allowsAuthentication(pageURL) else {
                 return .manual("Return to the OpenAI reauthentication page and continue.")
-            }
-            if (try? await hasSecurityChallenge(in: session)) == true {
-                return .manual("Complete the CAPTCHA or security check in the browser.")
             }
 
             do {
-                let password = try await fillAndSubmit(
-                    selectors: passwordSelectors,
-                    value: account.password,
-                    context: .authentication,
-                    in: session)
-                if password == .ambiguous || password == .noForm {
-                    return .manual("The password confirmation page is ambiguous.")
+                if TrustedChatGPTOrigin.allowsSecurityAutomation(pageURL) {
+                    guard try await hasAuthenticatedSession(for: account, in: session) else {
+                        return .manual("Sign in to the selected account to continue from Security settings.")
+                    }
+                    return .ready
                 }
-                if password == .submitted {
+                guard pageURL.host?.lowercased() == "auth.openai.com" else {
+                    return .manual("Return to ChatGPT Security settings and continue.")
+                }
+                if try await hasSecurityChallenge(in: session) {
+                    return .manual("Complete the CAPTCHA or security check in the browser.")
+                }
+                guard !operationIsCancelled, generation == session.cancellationGeneration else { return .cancelled }
+                guard session.webView.url == pageURL else { continue }
+
+                let path = pageURL.path.lowercased()
+                let emailRoute = Self.isPasswordEmailCodeRoute(pageURL)
+                if !chosePassword, !submittedPassword, !account.password.isEmpty,
+                   emailRoute || ["/log-in", "/log-in-or-create-account"].contains(path),
+                   try await RegistrationForm.selectPasswordLogin(in: session) {
+                    if emailRoute { externalMail?.switchedToPassword() }
+                    chosePassword = true
+                    deadline = clock.now.advanced(by: .seconds(30))
                     await waitAfterSubmission(in: session)
                     continue
                 }
 
-                let oldCode = try TOTPService.code(secret: account.totpSecret)
-                let otp = try await fillAndSubmit(
-                    selectors: otpSelectors,
-                    value: oldCode,
-                    context: .authentication,
-                    in: session)
-                if otp == .ambiguous || otp == .noForm {
-                    return .manual("The current authenticator challenge is ambiguous.")
+                if emailRoute, !submittedMail, !chosePassword || submittedPassword {
+                    let state = try await RegistrationForm.inspect(in: session)
+                    if state.kind == .emailCode, state.pageURL == session.webView.url {
+                        guard let externalMail else {
+                            return .manual("Подтвердите вход кодом из письма в браузере.")
+                        }
+                        if try await externalMail.submit(in: session, state: state) {
+                            submittedMail = true
+                            deadline = clock.now.advanced(by: .seconds(30))
+                            await waitAfterSubmission(in: session)
+                            continue
+                        }
+                    }
+                } else if path == "/log-in/password", !submittedPassword, !account.password.isEmpty {
+                    let password = try await ExternalLoginMailRequest.performTrigger(
+                        request: externalMail, in: session, from: pageURL,
+                        skipped: .notFound, wasSubmitted: { $0 == .submitted }
+                    ) {
+                        try await fillAndSubmit(
+                            selectors: passwordSelectors, value: account.password, context: .authentication,
+                            in: session, expectedPageURL: pageURL, expectedEmail: account.email)
+                    }
+                    if password == .ambiguous || password == .noForm {
+                        return .manual("The password confirmation page is ambiguous.")
+                    }
+                    if password == .submitted {
+                        submittedPassword = true
+                        deadline = clock.now.advanced(by: .seconds(30))
+                        await waitAfterSubmission(in: session)
+                        continue
+                    }
+                } else if path.hasPrefix("/mfa-challenge/") {
+                    guard allowAutomaticOldCode else {
+                        return .manual("Complete OpenAI identity confirmation manually in this same browser session.")
+                    }
+                    if !submittedOTP {
+                        let delay = TOTPService.safeSubmissionDelay()
+                        if delay > 0 { try await Task.sleep(for: .seconds(delay + 0.15)) }
+                        guard !operationIsCancelled, generation == session.cancellationGeneration else { return .cancelled }
+                        guard session.webView.url == pageURL else { continue }
+                        let text = try await authenticationPageText(in: session)
+                        guard session.webView.url == pageURL else { continue }
+                        if Self.isEmailLoginChallenge(text) {
+                            return .manual("Подтвердите вход кодом из письма в браузере.")
+                        }
+                        let oldCode = try TOTPService.code(secret: account.totpSecret)
+                        let otp = try await submitAuthenticationOTP(value: oldCode, in: session, expectedPageURL: pageURL)
+                        if otp == .ambiguous || otp == .noForm {
+                            return .manual("The current authenticator challenge is ambiguous.")
+                        }
+                        if otp == .submitted {
+                            submittedOTP = true
+                            deadline = clock.now.advanced(by: .seconds(30))
+                            await waitAfterSubmission(in: session)
+                            continue
+                        }
+                    }
                 }
-                if otp == .submitted {
-                    await waitAfterSubmission(in: session)
-                    continue
-                }
+            } catch let error as ExternalLoginMailError {
+                return .manual(error.localizedDescription)
+            } catch SavedSessionError.wrongAccount {
+                return .manual(SavedSessionError.wrongAccount.localizedDescription)
             } catch {
+                if operationIsCancelled || generation != session.cancellationGeneration { return .cancelled }
                 return .manual("Complete OpenAI identity confirmation in the browser.")
             }
 
@@ -3920,11 +4023,13 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
 
     func authenticatorSwitch(
         click: Bool,
-        in session: BrowserSession
+        in session: BrowserSession,
+        expectedState: AuthenticatorSwitchResult? = nil
     ) async throws -> AuthenticatorSwitchResult {
         guard TrustedChatGPTOrigin.allowsSecurityAutomation(session.webView.url) else {
             throw BrowserSessionError.untrustedOrigin
         }
+        let expectedStateJSON = try Self.json(expectedState?.rawValue ?? "")
         let labelsJSON = try Self.json(authenticatorLabels.map {
             $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         })
@@ -3962,11 +4067,14 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
               ? true
               : control.getAttribute("aria-checked") === "false" ? false : null;
           if (rawState === null) return "ambiguous";
+          const state = rawState ? "on" : "off";
+          const expectedState = \(expectedStateJSON);
+          if (expectedState && state !== expectedState) return "ambiguous";
           if (\(click ? "true" : "false")) {
             control.click();
             return "clicked";
           }
-          return rawState ? "on" : "off";
+          return state;
         })()
         """
         guard let raw = try await session.evaluate(script) as? String,
@@ -4234,7 +4342,7 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
     private func startAuthenticatorSetup(in session: BrowserSession) async throws -> ControlResult {
         switch try await authenticatorSwitch(click: false, in: session) {
         case .off:
-            return try await authenticatorSwitch(click: true, in: session) == .clicked
+            return try await authenticatorSwitch(click: true, in: session, expectedState: .off) == .clicked
                 ? .clicked : .ambiguous
         case .notFound:
             return try await clickUniqueControl(labels: enableLabels, click: true, in: session)

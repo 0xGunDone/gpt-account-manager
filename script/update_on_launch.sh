@@ -6,6 +6,8 @@ APP_NAME='GPT Account Manager.app'
 APP_EXECUTABLE=GPTAccountManager
 APP_IDENTIFIER=local.wemakecode.gptaccountmanager
 ORIGIN_URL=https://github.com/0xGunDone/gpt-account-manager.git
+RELEASE_URL=https://api.github.com/repos/0xGunDone/gpt-account-manager/releases/latest
+STABLE_REF=refs/gptam/stable
 SYSTEM_PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
 # Keep the launch password out of Git, signing, and build subprocesses.
@@ -26,12 +28,22 @@ valid_commit() {
   [[ "$1" =~ ^[0-9a-f]{40}$ ]]
 }
 
-checkout_git() {
-  /usr/bin/env -i PATH="$SYSTEM_PATH" HOME="$HOME" LC_ALL=C \
+git_environment() {
+  local git_home="$1"
+  shift
+  /usr/bin/env -i PATH="$SYSTEM_PATH" HOME="$git_home" LC_ALL=C \
     GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \
     GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false \
-    /usr/bin/git -C "$root" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+    "$@"
+}
+
+checkout_git() {
+  git_environment "$HOME" /usr/bin/git -C "$root" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
     -c submodule.recurse=false "$@"
+}
+
+release_git() {
+  git_environment "$scratch" /usr/bin/git --git-dir="$scratch/release.git" "$@"
 }
 
 valid_checkout() {
@@ -57,10 +69,13 @@ clean_checkout() {
   [[ -z "$hidden" ]]
 }
 
+stable_commit() {
+  checkout_git rev-parse --verify --quiet "$STABLE_REF" || :
+}
+
 checkout_matches() {
   valid_checkout &&
-    [[ "$(checkout_git rev-parse --verify HEAD)" == "$1" &&
-       "$(checkout_git rev-parse --verify refs/remotes/origin/main)" == "$2" ]] &&
+    [[ "$(checkout_git rev-parse --verify HEAD)" == "$1" && "$(stable_commit)" == "$2" ]] &&
     clean_checkout
 }
 
@@ -98,12 +113,43 @@ same_signer() {
   fi
 }
 
-fetch_canonical_branch() {
+latest_release_tag() {
+  local response="$scratch/release.json"
+  /usr/bin/env -i PATH="$SYSTEM_PATH" HOME="$scratch" LC_ALL=C /usr/bin/curl -q \
+    --fail --silent --show-error --proto '=https' --connect-timeout 4 --max-time 8 \
+    --max-filesize 2097152 --header 'Accept: application/vnd.github+json' \
+    --output "$response" "$RELEASE_URL" || return 1
+  /usr/bin/python3 -I -S - "$response" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as response:
+    release = json.load(response)
+if (
+    not isinstance(release, dict)
+    or release.get("draft") is not False
+    or release.get("prerelease") is not False
+):
+    sys.exit("Expected a published stable GitHub release")
+tag = release.get("tag_name")
+published = release.get("published_at")
+stable_version = r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+if not isinstance(published, str) or not published or not isinstance(tag, str) or not re.fullmatch(stable_version, tag):
+    sys.exit("Expected a published release with a vX.Y.Z tag")
+print(tag)
+PY
+}
+
+fetch_canonical_tag() {
+  local tag_ref="$1" local_objects
+  release_git init --quiet --bare --template= || return 1
+  local_objects=$(checkout_git rev-parse --path-format=absolute --git-path objects) || return 1
+  [[ -d "$local_objects" && "$local_objects" != *$'\n'* ]] || return 1
+  printf '%s\n' "$local_objects" > "$scratch/release.git/objects/info/alternates" || return 1
+
   # Git has no overall HTTP deadline. Limit its own process group, including the HTTPS helper.
-  /usr/bin/env -i PATH="$SYSTEM_PATH" HOME="$scratch" LC_ALL=C \
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
-    GIT_ASKPASS=/usr/bin/false GIT_NO_REPLACE_OBJECTS=1 \
-    /usr/bin/perl -e '
+  git_environment "$scratch" /usr/bin/perl -e '
       use POSIX qw(setsid);
       my $child = fork();
       die "Could not start Git: $!\n" unless defined $child;
@@ -121,42 +167,64 @@ fetch_canonical_branch() {
       waitpid $child, 0;
       alarm 0;
       exit(($? & 127) ? 128 + ($? & 127) : $? >> 8);
-    ' /usr/bin/git -c credential.helper= -c protocol.allow=never -c protocol.https.allow=always \
-    -c http.followRedirects=false -c core.hooksPath=/dev/null clone --quiet --bare \
-    --single-branch --branch main --no-tags --reference-if-able "$root" -- "$ORIGIN_URL" "$scratch/remote.git"
+    ' /usr/bin/git --git-dir="$scratch/release.git" -c credential.helper= \
+    -c protocol.allow=never -c protocol.https.allow=always -c http.followRedirects=false \
+    -c core.hooksPath=/dev/null fetch --quiet --no-tags --no-recurse-submodules \
+    --no-auto-gc -- "$ORIGIN_URL" "$tag_ref:$tag_ref"
 }
 
-prepare_update() {
-  local built_commit="$1" head tracking fetched staged
-  valid_commit "$built_commit" || fail 'Invalid installed build commit.'
+sync_release() {
+  local built_commit="${1-}" head previous tag tag_ref fetched
+  release_commit=
   valid_checkout && clean_checkout || fail 'Checkout must be clean with main tracking the public origin/main.'
   head=$(checkout_git rev-parse --verify HEAD)
-  tracking=$(checkout_git rev-parse --verify refs/remotes/origin/main)
-  checkout_git merge-base --is-ancestor "$head" "$tracking" || fail 'Local main has commits outside origin/main.'
-  [[ "$(bundle_commit "$installed")" == "$built_commit" ]] && valid_bundle "$installed" || fail 'Invalid installed app bundle.'
+  previous=$(stable_commit)
 
   scratch=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/gptam-fetch.XXXXXX")
   trap '/bin/rm -rf -- "$scratch"' EXIT
-  fetch_canonical_branch >&2 || fail 'Could not fetch public main.'
-  fetched=$(checkout_git --git-dir="$scratch/remote.git" rev-parse --verify 'refs/heads/main^{commit}')
-  valid_commit "$fetched" || fail 'Invalid public main commit.'
-  checkout_matches "$head" "$tracking" || fail 'Checkout changed during fetch.'
+  tag=$(latest_release_tag) || fail 'Could not read the latest stable GitHub release.'
+  tag_ref="refs/tags/$tag"
+  fetch_canonical_tag "$tag_ref" >&2 || fail "Could not fetch stable release tag $tag."
+  fetched=$(release_git rev-parse --verify "$tag_ref^{commit}") || fail "Release $tag does not identify a commit."
+  valid_commit "$fetched" || fail 'Invalid stable release commit.'
+  checkout_matches "$head" "$previous" || fail 'Checkout changed during fetch.'
   if ! checkout_git cat-file -e "$fetched^{commit}" 2>/dev/null; then
     checkout_git -c protocol.allow=never -c protocol.file.allow=always fetch --quiet \
       --no-write-fetch-head --no-tags --no-recurse-submodules --no-auto-gc --refmap= \
-      -- "$scratch/remote.git" refs/heads/main >&2 || fail 'Could not import fetched commit.'
+      -- "$scratch/release.git" "$tag_ref" >&2 || fail 'Could not import the stable release commit.'
   fi
-  checkout_git merge-base --is-ancestor "$tracking" "$fetched" || fail 'Public main no longer descends from origin/main.'
-  checkout_matches "$head" "$tracking" || fail 'Checkout changed before fast-forward.'
-  if [[ "$tracking" != "$fetched" ]]; then
-    checkout_git update-ref -m 'GPT Account Manager startup update' refs/remotes/origin/main "$fetched" "$tracking" >&2
+  if [[ -n "$previous" ]] && ! checkout_git merge-base --is-ancestor "$previous" "$fetched"; then
+    fail 'Stable release does not descend from the previously accepted release.'
   fi
+  if [[ "$head" != "$fetched" ]] && checkout_git merge-base --is-ancestor "$fetched" "$head"; then
+    printf 'Local main is ahead of stable release %s. Keeping the current checkout.\n' "$tag" >&2
+    return 0
+  fi
+  if [[ -n "$built_commit" ]]; then
+    if [[ "$built_commit" != "$fetched" ]] && checkout_git merge-base --is-ancestor "$fetched" "$built_commit"; then
+      return 0
+    fi
+    checkout_git merge-base --is-ancestor "$built_commit" "$fetched" || fail 'Stable release does not descend from the installed app.'
+  fi
+  checkout_git merge-base --is-ancestor "$head" "$fetched" || fail 'Local main diverges from the stable release.'
+  checkout_matches "$head" "$previous" || fail 'Checkout changed before fast-forward.'
   if [[ "$head" != "$fetched" ]]; then
-    checkout_matches "$head" "$fetched" || fail 'Checkout changed before fast-forward.'
     checkout_git merge --ff-only --no-autostash --no-overwrite-ignore -- "$fetched" >&2 || fail 'Fast-forward failed.'
+    printf 'Updated checkout to stable release %s.\n' "$tag" >&2
   fi
-  checkout_matches "$fetched" "$fetched" || fail 'Checkout does not match public main.'
-  [[ "$built_commit" != "$fetched" ]] || return 0
+  checkout_matches "$fetched" "$previous" || fail 'Checkout changed during fast-forward.'
+  if [[ "$previous" != "$fetched" ]]; then
+    checkout_git update-ref -m "GPT Account Manager stable release $tag" "$STABLE_REF" "$fetched" "$previous" >&2
+  fi
+  release_commit="$fetched"
+}
+
+prepare_update() {
+  local built_commit="$1" staged
+  valid_commit "$built_commit" || fail 'Invalid installed build commit.'
+  [[ "$(bundle_commit "$installed")" == "$built_commit" ]] && valid_bundle "$installed" || fail 'Invalid installed app bundle.'
+  sync_release "$built_commit"
+  [[ -n "$release_commit" && "$built_commit" != "$release_commit" ]] || return 0
 
   /bin/mkdir -p -- "$root/.build"
   canonical_directory "$root/.build" || fail 'Invalid build directory.'
@@ -170,8 +238,8 @@ prepare_update() {
     >"$scratch/build.log" || { /bin/cat "$scratch/build.log" >&2; fail 'Build failed.'; }
   /bin/cat "$scratch/build.log" >&2
   staged=$(/usr/bin/sed -n 's/^Staged app at //p' "$scratch/build.log")
-  checkout_matches "$fetched" "$fetched" || fail 'Checkout changed during build.'
-  valid_stage "$staged" && [[ "$(bundle_commit "$staged")" == "$fetched" ]] && same_signer "$staged" ||
+  checkout_matches "$release_commit" "$release_commit" || fail 'Checkout changed during build.'
+  valid_stage "$staged" && [[ "$(bundle_commit "$staged")" == "$release_commit" ]] && same_signer "$staged" ||
     fail 'Staged app failed path, commit, or signing checks.'
   printf '%s\n' "$staged"
 }
@@ -252,11 +320,12 @@ install_update() {
 mode=${1-}
 root=${2-}
 [[ "$root" == /* && "$root" != *$'\n'* ]] && canonical_directory "$root" &&
-  canonical_directory "$root/dist" && [[ ! -L "$root/.build" ]] || fail 'Invalid checkout path.'
+  [[ ! -L "$root/.build" ]] || fail 'Invalid checkout path.'
 installed="$root/dist/$APP_NAME"
 
 case "$mode:$#" in
-  prepare:3) prepare_update "$3" ;;
-  install:4) install_update "$3" "$4" ;;
-  *) fail 'Usage: prepare <root> <builtCommit> or install <root> <appPID> <stagedBundle>.' ;;
+  sync:2) sync_release ;;
+  prepare:3) canonical_directory "$root/dist" || fail 'Invalid dist directory.'; prepare_update "$3" ;;
+  install:4) canonical_directory "$root/dist" || fail 'Invalid dist directory.'; install_update "$3" "$4" ;;
+  *) fail 'Usage: sync <root>, prepare <root> <builtCommit>, or install <root> <appPID> <stagedBundle>.' ;;
 esac

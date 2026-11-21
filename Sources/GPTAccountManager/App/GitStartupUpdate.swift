@@ -12,7 +12,7 @@ final class GitStartupUpdate {
 
         var title: String {
             switch self {
-            case .checking: "Проверяю обновления в Git…"
+            case .checking: "Проверяю стабильный релиз GitHub…"
             case .restarting: "Запускаю обновлённую версию…"
             case .ready: ""
             }

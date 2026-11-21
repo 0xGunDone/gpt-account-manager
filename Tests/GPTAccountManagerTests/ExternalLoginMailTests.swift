@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import Testing
+import WebKit
 @testable import GPTAccountManager
 
 @MainActor
@@ -31,6 +32,62 @@ final class ExternalLoginMailboxFixture: EmailCodeReceiving {
     }
 
     func cancel() {}
+}
+
+@MainActor
+private final class RotationMailTransition: NSObject, WKScriptMessageHandler {
+    var actions: [String] = []
+
+    static let signedIn = """
+    <script>window.fetch=async()=>({ok:true,json:async()=>({user:{email:'owner@example.com'}})});</script>
+    """
+    static let toggle = """
+    <button role="switch" aria-label="Authenticator app" aria-checked="true"
+      onclick="window.webkit.messageHandlers.rotationMail.postMessage('disable')">Authenticator app</button>
+    """
+    static let passwordChoice = """
+    <a href="/log-in/password" onclick="event.preventDefault();window.webkit.messageHandlers.rotationMail.postMessage('choose-password')">Continue with password</a>
+    """
+    static let emailForm = """
+    <main><p>Code sent to owner@example.com</p>
+      <form onsubmit="event.preventDefault();window.webkit.messageHandlers.rotationMail.postMessage('code:' + this.code.value)">
+        <input name="code" autocomplete="one-time-code"><button>Continue</button>
+      </form>
+    </main>
+    """
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard let action = message.body as? String, let webView = message.webView else { return }
+        actions.append(action)
+        switch action {
+        case "disable":
+            webView.loadHTMLString(Self.emailForm, baseURL: URL(string: "https://auth.openai.com/email-verification"))
+        case "choose-password":
+            webView.loadHTMLString("""
+            <main><p>Sign in to owner@example.com</p>
+              <form onsubmit="event.preventDefault();window.webkit.messageHandlers.rotationMail.postMessage('password:' + this.password.value)">
+                <input type="password" name="password"><button>Continue</button>
+              </form>
+            </main>
+            """, baseURL: URL(string: "https://auth.openai.com/log-in/password"))
+        case "password:fixture-password":
+            webView.loadHTMLString("""
+            <main><h1>Authenticator app</h1>
+              <form onsubmit="event.preventDefault();window.webkit.messageHandlers.rotationMail.postMessage('unexpected-totp')">
+                <input name="code" autocomplete="one-time-code"><button>Continue</button>
+              </form>
+            </main>
+            """, baseURL: URL(string: "https://auth.openai.com/mfa-challenge/totp"))
+        case let code where code.hasPrefix("code:"):
+            webView.loadHTMLString(Self.signedIn + """
+            <section><button role="switch" aria-label="Authenticator app" aria-checked="true">Authenticator app</button>
+              <button onclick="this.previousElementSibling.setAttribute('aria-checked','false');this.remove()">Remove</button>
+            </section>
+            """, baseURL: URL(string: "https://chatgpt.com/settings/security?action=disable&factor=totp"))
+        default:
+            Issue.record("Unexpected fixture action")
+        }
+    }
 }
 
 @MainActor
@@ -126,5 +183,56 @@ struct ExternalLoginMailTests {
         #expect(mailbox.captures == 2 && mailbox.reads == 0)
         #expect(try await session.evaluate("window.codes.length") as? Int == 0)
         #expect(try await session.evaluate("window.resends") as? Int == 0)
+    }
+
+    @Test(arguments: [false, true])
+    func rotationHandlesEmailChallengeInOriginalSession(resuming: Bool) async throws {
+        enum CheckpointReached: Error { case oldMethodDisabled }
+        _ = NSApplication.shared
+        let session = BrowserSession(dataStore: .nonPersistent())
+        session.webView.frame = NSRect(x: 0, y: 0, width: 800, height: 600)
+        session.webView.navigationDelegate = nil
+        let transition = RotationMailTransition()
+        session.webView.configuration.userContentController.add(transition, name: "rotationMail")
+        defer { session.webView.configuration.userContentController.removeScriptMessageHandler(forName: "rotationMail") }
+        let mailbox = ExternalLoginMailboxFixture()
+        mailbox.beforeCapture = {
+            #expect(transition.actions.isEmpty || transition.actions == ["choose-password"])
+        }
+        mailbox.beforeRead = {
+            #expect(transition.actions == ["disable"])
+        }
+        let browser = ChatGPTAutomation(
+            sessionManager: WebSessionManager(accountSessionFactory: { _ in session }),
+            makeExternalMailbox: { _ in mailbox })
+        var account = try account()
+        account.totpSecret = "JBSWY3DPEHPK3PXP"
+        browser.prepareBrowserSession(for: account)
+        if resuming { account.rotationStage = .removingOldMethod }
+        session.webView.loadHTMLString(
+            resuming ? RotationMailTransition.emailForm + RotationMailTransition.passwordChoice
+                : RotationMailTransition.signedIn + RotationMailTransition.toggle,
+            baseURL: URL(string: resuming ? "https://auth.openai.com/email-verification" : "https://chatgpt.com/settings/security"))
+        for _ in 0..<100 where session.webView.isLoading { try await Task.sleep(for: .milliseconds(25)) }
+        try #require(!session.webView.isLoading)
+        var checkpoints: [RotationCheckpointEvent] = []
+        let result = await browser.rotate2FA(account: account) { checkpoint in
+            checkpoints.append(checkpoint)
+            if checkpoint == .oldMethodDisabled { throw CheckpointReached.oldMethodDisabled }
+        }
+
+        if resuming {
+            guard case .manualActionRequired(stage: .removingOldMethod, _) = result else {
+                Issue.record("Uncertain removal must leave the old authenticator challenge for manual verification")
+                return
+            }
+            #expect(transition.actions == ["choose-password", "password:fixture-password"])
+            #expect(checkpoints.isEmpty && mailbox.reads == 0)
+            #expect(try await session.evaluate("document.querySelector('input[name=code]').value") as? String == "")
+        } else {
+            #expect(transition.actions == ["disable", "code:123456"])
+            #expect(mailbox.captures == 1 && mailbox.reads == 1)
+            #expect(checkpoints == [.removalStarted, .removalStarted, .oldMethodDisabled])
+        }
     }
 }

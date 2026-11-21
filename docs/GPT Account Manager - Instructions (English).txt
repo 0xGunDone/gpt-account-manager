@@ -20,15 +20,18 @@ SYSTEM REQUIREMENTS
 
 INSTALLATION AND UPDATES
 
-    git clone https://github.com/0xGunDone/gpt-account-manager.git
+    git clone --branch v1.1.0 https://github.com/0xGunDone/gpt-account-manager.git
     cd gpt-account-manager
+    git switch -c main
+    git branch --set-upstream-to=origin/main main
     ./run.sh
 
 After the first build, open dist/GPT Account Manager.app from Finder or the
-Dock. At startup the app checks the public GitHub main branch, builds any
-fast-forward update, and relaunches. Keep the app in dist inside a clean clone
-on main tracking origin/main. If the check or build fails, the app opens the
-previous build. You can still run ./run.sh to update and build from Terminal.
+Dock. At startup the app checks the latest stable GitHub release. It builds a
+fast-forward update from that release's tag and relaunches. Keep the app in
+dist inside a clean clone on main tracking origin/main. If the check or build
+fails, the app opens the installed version. ./run.sh uses the same update
+channel from Terminal.
 See the README for password configuration and the Safari extension.
 
 MAIN WINDOW
@@ -213,5 +216,5 @@ External login links and callback URLs
 The login field accepts full HTTP/HTTPS links. Keep “Return to application” for the existing automatic callback. Choose “Copy callback” to capture the OAuth return URL without opening its destination. The editable address bar above the browser supports Go and Copy URL; failed localhost callbacks remain available to copy.
 
 Change access
-The account and group action offers Password, 2FA, or Password and 2FA. The target password is @subzavozbot. Combined mode verifies the new password first, then runs the existing 2FA rotation. Password-only leaves the authenticator unchanged. The previous password remains primary until a fresh login verifies the new password and account identity.
+The account and group action offers Password, 2FA, or Password and 2FA. Set the target password through GPTAM_NEW_PASSWORD before launch. Combined mode verifies the new password first, then runs the existing 2FA rotation. Password-only leaves the authenticator unchanged. The previous password remains primary until a fresh login verifies the new password and account identity.
 OpenAI may require an email verification code to change a password. Without mailbox access this step cannot be completed. Stop before submitting a new password to return to the 2FA-only option. A submitted candidate remains saved for recovery. Use “Password already changed manually — verify” after a manual password change.
