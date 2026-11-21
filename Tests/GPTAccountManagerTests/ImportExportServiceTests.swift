@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import GPTAccountManager
 
@@ -53,6 +54,56 @@ import Testing
         #expect(result.records[0].password == "new")
         #expect(result.duplicateEmails == ["same@example.com"])
         #expect(result.issues == [ImportIssue(lineNumber: 2, message: "Expected LOGIN|PASS|2FA")])
+    }
+
+    @Test(arguments: [
+        "https://mail.example.test/code?key=fixture",
+        "[Получить код](https://mail.example.test/code?key=fixture)",
+        "[https://mail.example.test/code?key=fixture](https://mail.example.test/code?key=fixture)",
+    ])
+    func labeledImportAcceptsRawAndMarkdownEndpoints(link: String) throws {
+        let result = ImportExportService.parse("""
+        Email: One@example.com
+        Password:  with:literal|delimiters
+        2FA: JBSWY3DPEHPK3PXP
+
+        Mailbox email: inbox@example.com
+        Ссылка для кода с почты: \(link)
+        two@example.com|fixture|KRUGS4ZANFZSAYJA
+        """, separator: .automatic)
+
+        #expect(result.issues.isEmpty)
+        #expect(result.records.map(\.email) == ["One@example.com", "two@example.com"])
+        let first = try #require(result.records.first)
+        #expect(first.password == " with:literal|delimiters")
+        let mailbox = try #require(first.externalMailbox)
+        #expect(mailbox.address == "inbox@example.com")
+        #expect(mailbox.codeURL.absoluteString == "https://mail.example.test/code?key=fixture")
+        #expect(result.records.last?.externalMailbox == nil)
+    }
+
+    @Test(arguments: [
+        "",
+        "http://mail.example.test/code?key=fixture",
+        "[https://mail.example.test/code](https://other.example.test/code?key=fixture)",
+    ])
+    func invalidMailboxBlockDoesNotFallBackToPartialCredentials(link: String) {
+        let result = ImportExportService.parse("""
+        Email: invalid@example.com
+        Password: fixture
+        2FA: JBSWY3DPEHPK3PXP
+        Mailbox email: inbox@example.com
+        Ссылка для кода с почты: \(link)
+        Email: valid@example.com
+        Password: fixture
+        2FA: JBSWY3DPEHPK3PXP
+        Mailbox email: valid@example.com
+        Ссылка для кода с почты: https://mail.example.test/code?key=valid-fixture
+        """)
+
+        #expect(result.records.map(\.email) == ["valid@example.com"])
+        #expect(result.issues == [ImportIssue(
+            lineNumber: 1, message: "Expected Email, Password, 2FA, Mailbox email, and valid HTTPS code URL")])
     }
 
     @Test func invalidTOTPSecretIsRejectedAtImportBoundary() {

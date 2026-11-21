@@ -115,6 +115,9 @@ final class AccountStore {
                 else { throw AccountStoreError.rotationRecoveryActive }
                 candidate[index].email = credential.email
                 candidate[index].password = credential.password
+                if let externalMailbox = credential.externalMailbox {
+                    candidate[index].externalMailbox = externalMailbox
+                }
                 // Importing an existing login must not silently replace the
                 // working authenticator. Edit credentials explicitly when a
                 // 2FA secret really needs to change.
@@ -156,6 +159,20 @@ final class AccountStore {
             groups: groups,
             accounts: candidate,
             selectedID: selectedID(for: candidate))
+    }
+
+    func updateExternalMailbox(
+        id: UUID,
+        configuration: ExternalMailboxConfiguration?,
+        protectedIDs: Set<UUID>
+    ) throws {
+        guard !protectedIDs.contains(id),
+              let account = accounts.first(where: { $0.id == id })
+        else { throw AccountStoreError.accountBusy }
+        guard account.rotationStage == nil, account.pendingTOTPSecret == nil,
+              !account.hasPendingCredentialChange
+        else { throw AccountStoreError.rotationRecoveryActive }
+        try mutate(id: id) { $0.externalMailbox = configuration }
     }
 
     func mutate(id: UUID, _ change: (inout AccountRecord) -> Void) throws {
@@ -899,11 +916,15 @@ final class AccountStore {
         var candidateAccounts = candidateAccounts
         let previousByID = Dictionary(accounts.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         for index in candidateAccounts.indices {
-            guard let previous = previousByID[candidateAccounts[index].id],
-                  candidateAccounts[index].accessToken == previous.accessToken else { continue }
             let candidate = candidateAccounts[index]
+            guard let previous = previousByID[candidate.id] else { continue }
+            let loginEmailChanged = candidate.email.caseInsensitiveCompare(previous.email) != .orderedSame
+            if loginEmailChanged {
+                candidateAccounts[index].externalMailbox = nil
+            }
             // Keep explicitly replaced tokens; invalidate cached tokens when their login changes.
-            if candidate.email.caseInsensitiveCompare(previous.email) != .orderedSame ||
+            if candidate.accessToken == previous.accessToken,
+                loginEmailChanged ||
                 candidate.password != previous.password || candidate.totpSecret != previous.totpSecret ||
                 candidate.browserStoreID != previous.browserStoreID {
                 candidateAccounts[index].accessToken = nil

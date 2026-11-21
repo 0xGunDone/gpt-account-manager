@@ -53,6 +53,40 @@ import Testing
         #expect(summary == AccountImportSummary(imported: 1, duplicates: 1, rejected: 0))
     }
 
+    @Test func explicitMailboxImportsAndSurvivesLegacyImportsWithoutReplacingActiveTwoFA() throws {
+        let store = store()
+        defer { try? FileManager.default.removeItem(at: store.fileURL.deletingLastPathComponent()) }
+        let initial = try AccountImportService.importText("""
+        Email: one@example.com
+        Password: initial
+        2FA: JBSWY3DPEHPK3PXP
+        Mailbox email: forwarding@example.com
+        Ссылка для кода с почты: https://mail.example.test/code?key=initial-fixture
+        """, into: store)
+        #expect(initial.imported == 1 && initial.rejected == 0)
+        #expect(store.accounts.first?.externalMailbox?.address == "forwarding@example.com")
+
+        let replaced = try AccountImportService.importText("""
+        Email: ONE@example.com
+        Password: updated
+        2FA: KRUGS4ZANFZSAYJA
+        Mailbox email: one@example.com
+        Ссылка для кода с почты: https://mail.example.test/code?key=replaced-fixture
+        one@example.com|last-password|KRUGS4ZANFZSAYJA
+        """, into: store)
+        #expect(replaced == AccountImportSummary(imported: 1, duplicates: 1, rejected: 0, preservedTwoFA: 1))
+        #expect(store.accounts.first?.password == "last-password")
+
+        _ = try AccountImportService.importText("one@example.com|legacy-refresh|KRUGS4ZANFZSAYJA", into: store)
+        let reloaded = AccountStore(fileURL: store.fileURL)
+        try reloaded.load()
+        let account = try #require(reloaded.accounts.first)
+        #expect(account.password == "legacy-refresh")
+        #expect(account.totpSecret == "JBSWY3DPEHPK3PXP")
+        #expect(account.externalMailbox?.address == "one@example.com")
+        #expect(account.externalMailbox?.codeURL.absoluteString == "https://mail.example.test/code?key=replaced-fixture")
+    }
+
     @Test func automaticImportDeduplicatesMixedFormatsAndPreservesRotatedTwoFA() throws {
         let store = store()
         _ = try AccountImportService.importText(

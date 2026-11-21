@@ -408,6 +408,18 @@ struct ContentView: View {
                                 return "Не удалось сохранить аккаунт."
                             }
                         },
+                        onSaveExternalMailbox: { configuration in
+                            do {
+                                try store.updateExternalMailbox(id: account.id, configuration: configuration,
+                                                                protectedIDs: protectedAccountIDs)
+                                return nil
+                            } catch AccountStoreError.accountBusy, AccountStoreError.rotationRecoveryActive {
+                                return "Дождитесь завершения операции с аккаунтом."
+                            } catch {
+                                return configuration == nil ? "Не удалось удалить настройку внешней почты."
+                                    : "Не удалось сохранить настройку внешней почты."
+                            }
+                        },
                         onCopyOneTimeCode: copy,
                         onOpenOAuth: { text, mode in
                             await coordinator.openOAuthURL(for: account.id, text: text, mode: mode)
@@ -1060,7 +1072,7 @@ struct ContentView: View {
         do {
             let summary = try AccountImportService.importText(directImportText, into: store, separator: separator)
             guard summary.imported > 0 else {
-                directImportError = "Аккаунты не распознаны. Проверьте разделитель и формат LOGIN, PASS, 2FA."
+                directImportError = "Аккаунты не распознаны. Проверьте формат, 2FA и поля внешней почты."
                 return
             }
             directImportText = ""
@@ -1309,7 +1321,7 @@ private struct DirectTextImportSheet: View {
             Text(filename == nil ? "Добавить аккаунты текстом" : "Импорт аккаунтов из файла")
                 .font(.title3.weight(.semibold))
             if let filename { Text(filename).font(.callout).foregroundStyle(.secondary) }
-            Text("Одна строка — один аккаунт: логин, пароль, ключ 2FA.")
+            Text("Вставьте строки аккаунтов или блоки с полями Email, Password, 2FA, Mailbox email и «Ссылка для кода с почты».")
                 .foregroundStyle(.secondary)
 
             Picker("Разделитель", selection: $separatorChoice) {
@@ -1336,7 +1348,7 @@ private struct DirectTextImportSheet: View {
                 Text("Распознано: \(preview.records.count). Ошибки: \(preview.issues.count). Дубликаты: \(preview.duplicateEmails.count).")
                     .font(.callout).foregroundStyle(.secondary)
                 if !preview.issues.isEmpty {
-                    Text("Проверьте строки: \(preview.issues.prefix(6).map { String($0.lineNumber) }.joined(separator: ", "))\(preview.issues.count > 6 ? "…" : ""). Уточните разделитель и ключ 2FA; эти строки не будут добавлены.")
+                    Text("Ошибки в строках \(preview.issues.prefix(6).map { String($0.lineNumber) }.joined(separator: ", "))\(preview.issues.count > 6 ? "…" : ""). Проверьте формат, 2FA и поля внешней почты.")
                         .font(.caption).foregroundStyle(.orange)
                 }
             } else {

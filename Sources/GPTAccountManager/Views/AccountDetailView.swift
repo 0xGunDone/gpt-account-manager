@@ -14,6 +14,7 @@ struct AccountDetailView: View {
     let credentialsEditable: Bool
     let rotationState: RotationQueueItemState?
     let onSaveCredentials: (String) -> String?
+    let onSaveExternalMailbox: (ExternalMailboxConfiguration?) -> String?
     let onCopyOneTimeCode: (String) -> Void
     let onOpenOAuth: (String, OAuthCallbackMode) async -> String?
     let onOpenSafari: () async -> String?
@@ -32,6 +33,9 @@ struct AccountDetailView: View {
     @State private var tagText: String
     @State private var credentialText: String
     @State private var credentialError: String?
+    @State private var externalMailboxAddress: String
+    @State private var externalMailboxURL = ""
+    @State private var externalMailboxError: String?
     @State private var manualSecretText = ""
     @State private var manualPassword = ""
     @State private var manualSecretError: String?
@@ -56,6 +60,7 @@ struct AccountDetailView: View {
         credentialsEditable: Bool,
         rotationState: RotationQueueItemState?,
         onSaveCredentials: @escaping (String) -> String?,
+        onSaveExternalMailbox: @escaping (ExternalMailboxConfiguration?) -> String?,
         onCopyOneTimeCode: @escaping (String) -> Void,
         onOpenOAuth: @escaping (String, OAuthCallbackMode) async -> String?,
         onOpenSafari: @escaping () async -> String?,
@@ -83,6 +88,7 @@ struct AccountDetailView: View {
         self.credentialsEditable = credentialsEditable
         self.rotationState = rotationState
         self.onSaveCredentials = onSaveCredentials
+        self.onSaveExternalMailbox = onSaveExternalMailbox
         self.onCopyOneTimeCode = onCopyOneTimeCode
         self.onOpenOAuth = onOpenOAuth
         self.onOpenSafari = onOpenSafari
@@ -99,6 +105,7 @@ struct AccountDetailView: View {
         self.onDelete = onDelete
         _tagText = State(initialValue: account.tag ?? "")
         _credentialText = State(initialValue: account.credentialLine)
+        _externalMailboxAddress = State(initialValue: account.externalMailbox?.address ?? account.email)
     }
 
     var body: some View {
@@ -130,6 +137,8 @@ struct AccountDetailView: View {
                     .font(.callout)
                     .foregroundStyle(.red)
             }
+
+            externalMailboxSettings
 
             VStack(alignment: .leading, spacing: 8) {
                 Text("Вход по ссылке в сессии аккаунта")
@@ -284,12 +293,69 @@ struct AccountDetailView: View {
             if credentialText != line { credentialText = line }
             credentialError = nil
         }
+        .onChange(of: account.externalMailbox) { resetExternalMailboxForm() }
+        .onChange(of: account.email.lowercased()) { resetExternalMailboxForm() }
         .alert("Не удалось открыть Safari", isPresented: $showsSafariError) {
             Button("ОК", role: .cancel) {}
         } message: {
             Text(safariError)
         }
         .onDisappear { safariTask?.cancel() }
+    }
+
+    private var externalMailboxSettings: some View {
+        DisclosureGroup(account.externalMailbox == nil ? "Внешняя почта для входа" : "Внешняя почта для входа · настроена") {
+            VStack(alignment: .leading, spacing: 8) {
+                TextField("Адрес почтового ящика", text: $externalMailboxAddress)
+                    .accessibilityLabel("Адрес почтового ящика")
+                SecureField("Секретная HTTPS-ссылка API", text: $externalMailboxURL)
+                    .accessibilityLabel("Секретная HTTPS-ссылка API")
+                    .onSubmit(saveExternalMailbox)
+                Text("Коды для входа в ChatGPT и импорта в CodexAcc. Ссылка хранится без шифрования в локальном accounts.json.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button("Сохранить настройку", action: saveExternalMailbox)
+                        .disabled(!canSaveExternalMailbox)
+                    if account.externalMailbox != nil {
+                        Button("Удалить настройку", role: .destructive) {
+                            externalMailboxError = onSaveExternalMailbox(nil)
+                        }
+                    }
+                }
+                if let externalMailboxError {
+                    Text(externalMailboxError)
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                }
+            }
+            .textFieldStyle(.roundedBorder)
+            .disabled(!credentialsEditable)
+            .padding(.top, 8)
+        }
+    }
+
+    private var canSaveExternalMailbox: Bool {
+        credentialsEditable && !externalMailboxAddress.allSatisfy(\.isWhitespace) &&
+            !externalMailboxURL.allSatisfy(\.isWhitespace)
+    }
+
+    private func saveExternalMailbox() {
+        guard canSaveExternalMailbox else { return }
+        do {
+            let configuration = try ExternalMailboxConfiguration(
+                address: externalMailboxAddress, codeURL: externalMailboxURL)
+            externalMailboxError = onSaveExternalMailbox(configuration)
+            if externalMailboxError == nil { externalMailboxURL = "" }
+        } catch {
+            externalMailboxError = "Проверьте адрес почтового ящика и HTTPS-ссылку API."
+        }
+    }
+
+    private func resetExternalMailboxForm() {
+        externalMailboxAddress = account.externalMailbox?.address ?? account.email
+        externalMailboxURL = ""
+        externalMailboxError = nil
     }
 
     private var groupBinding: Binding<UUID?> {

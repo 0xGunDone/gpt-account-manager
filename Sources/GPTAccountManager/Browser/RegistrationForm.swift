@@ -107,11 +107,18 @@ enum RegistrationForm {
           if (!trusted() || challenge()) return false;
           const passwordPath = \(pathJSON);
           const password = passwordPath !== null;
-          if (password ? !emailCodeRoute() : !entryRoute()) return false;
-          const labels = password ? passwordLabels : signupLabels;
+          const loginPassword = passwordPath === '/log-in/password';
+          const loginMethod = auth() && ['/log-in','/log-in-or-create-account'].includes(location.pathname);
+          if (password ? !(emailCodeRoute() || loginPassword && loginMethod) : !entryRoute()) return false;
+          const labels = loginPassword ? [...passwordLabels, 'continue with a password', 'log in with password', 'log in with a password',
+            'войти с паролем', 'вход с паролем', 'войти с помощью пароля'] : password ? passwordLabels : signupLabels;
           const controls = [...document.querySelectorAll('button,a,[role="button"]')]
             .filter(visible).filter(enabled).filter(e => labels.includes(name(e)))
             .filter(e => {
+              if (loginPassword && (e.form || e.hasAttribute('formaction'))) {
+                const action = new URL(e.getAttribute('formaction') || e.form?.action || location.href, location.href);
+                if (action.origin !== location.origin || action.username || action.password) return false;
+              }
               if (!e.hasAttribute('href')) return true;
               const url = new URL(e.getAttribute('href'), location.href);
               return password
@@ -136,10 +143,12 @@ enum RegistrationForm {
         return try await submit([password], kind: .password, in: session)
     }
 
-    static func submitEmailCode(_ code: String, expectedEmail: String, observedScreenOnly: Bool = false, in session: BrowserSession) async throws -> Bool {
+    static func submitEmailCode(_ code: String, expectedEmail: String, observedScreenOnly: Bool = false,
+                                observedScreenToken: String? = nil, in session: BrowserSession) async throws -> Bool {
         guard code.count == 6, code.allSatisfy({ $0 >= "0" && $0 <= "9" }) else { return false }
         return try await submit([code], kind: .emailCode, expectedEmail: expectedEmail.lowercased(),
-                                requireObservedEmailScreen: observedScreenOnly, in: session)
+                                requireObservedEmailScreen: observedScreenOnly,
+                                observedEmailScreenToken: observedScreenToken, in: session)
     }
 
     static func emailCodeScreenMatches(in session: BrowserSession, expectedEmail: String,
@@ -155,15 +164,38 @@ enum RegistrationForm {
           if (location.href !== expectedURL) return false;
           const form = findForm();
           if (form.kind !== 'emailCode' || form.displayedEmail !== expectedEmail) return false;
+          const external = identityKey === '__gptAccountManagerExternalMailWait';
+          if (external && (!sameOriginEmailCodeForm(form) || (\(capture ? "true" : "false") && form.fields.some(field => field.value)))) return false;
           const elements = [form.button, ...form.fields];
           if (\(capture ? "true" : "false")) {
-            document[identityKey] = {token, elements:elements.map(element => new WeakRef(element))};
+            const identity = {token, pageURL:location.href, elements:elements.map(element => new WeakRef(element))};
+            document[identityKey] = identity;
+            if (external) {
+              const controller = new AbortController();
+              const options = {capture:true, signal:controller.signal};
+              const invalidate = () => {
+                if (document[identityKey] === identity) delete document[identityKey];
+                controller.abort();
+              };
+              document.addEventListener('click', event => {
+                if (event.target instanceof Element && event.target.closest('button,a,[role="button"], input[type="submit"]')) invalidate();
+              }, options);
+              document.addEventListener('input', event => {
+                if (event.isTrusted && form.fields.includes(event.target)) invalidate();
+              }, options);
+            }
           }
           const identity = document[identityKey];
-          return identity?.token === token && identity.elements.length === elements.length &&
+          return identity?.token === token && identity.pageURL === location.href && identity.elements.length === elements.length &&
             identity.elements.every((reference, index) => reference.deref() === elements[index]);
         })()
         """) as? Bool == true
+    }
+
+    static func externalEmailCodeScreenMatches(in session: BrowserSession, expectedEmail: String,
+                                               pageURL: URL, token: String, capture: Bool = false) async throws -> Bool {
+        try await emailCodeScreenMatches(in: session, expectedEmail: expectedEmail, pageURL: pageURL, token: token,
+                                         capture: capture, identityKey: "__gptAccountManagerExternalMailWait")
     }
 
     static func submitProfile(fullName: String, age: Int, birthDate: String? = nil, in session: BrowserSession) async throws -> Bool {
@@ -221,7 +253,8 @@ enum RegistrationForm {
 
     private static func submit(_ values: [String], kind: Kind, expectedEmail: String? = nil,
                                birthDate: String? = nil, shouldSubmit: Bool = true,
-                               requireObservedEmailScreen: Bool = false, in session: BrowserSession) async throws -> Bool {
+                               requireObservedEmailScreen: Bool = false, observedEmailScreenToken: String? = nil,
+                               in session: BrowserSession) async throws -> Bool {
         try requireTrustedOrigin(session)
         if let birthDate {
             guard birthDate.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil else { return false }
@@ -239,6 +272,7 @@ enum RegistrationForm {
         let valuesJSON = String(decoding: try JSONEncoder().encode(values), as: UTF8.self)
         let emailJSON = String(decoding: try JSONEncoder().encode(expectedEmail), as: UTF8.self)
         let birthdayJSON = String(decoding: try JSONEncoder().encode(birthDate), as: UTF8.self)
+        let tokenJSON = String(decoding: try JSONEncoder().encode(observedEmailScreenToken), as: UTF8.self)
         let validation = """
         \(domHelpers)
         if (location.href !== new URL(\(pageJSON)).href) return 'invalid';
@@ -247,10 +281,12 @@ enum RegistrationForm {
         if (form.kind !== '\(kind.rawValue)' || !form.fields || !form.button ||
             ('\(kind.rawValue)' === 'password' && location.pathname !== '/create-account/password') ||
             (\(emailJSON) !== null && form.displayedEmail !== \(emailJSON))) return 'invalid';
-        if (\(requireObservedEmailScreen ? "true" : "false")) {
-          const identity = document.__gptAccountManagerMailWait;
+        const token = \(tokenJSON);
+        if (\(requireObservedEmailScreen ? "true" : "false") || token !== null) {
+          const identity = token === null ? document.__gptAccountManagerMailWait : document.__gptAccountManagerExternalMailWait;
           const elements = [form.button, ...form.fields];
-          if (!identity || identity.elements.length !== elements.length ||
+          if (!identity || (token !== null && (identity.token !== token || identity.pageURL !== location.href || !sameOriginEmailCodeForm(form))) ||
+              identity.elements.length !== elements.length ||
               identity.elements.some((reference, index) => reference.deref() !== elements[index])) return 'invalid';
         }
         const birthday = \(birthdayJSON);
@@ -387,6 +423,12 @@ enum RegistrationForm {
     const entryRoute = () => auth() ? ['/','/log-in','/create-account'].includes(location.pathname)
       : location.hostname === 'chatgpt.com' && ['/','/auth/login','/auth/signup'].includes(location.pathname);
     const emailCodeRoute = () => auth() && /^\/(email-verification|verify-email)(\/|$)/.test(location.pathname);
+    const sameOriginEmailCodeForm = form => {
+      const owner = form.fields[0].form;
+      if (!owner || form.button.form !== owner || form.fields.some(field => field.form !== owner)) return false;
+      const action = new URL(form.button.getAttribute('formaction') || owner.action, location.href);
+      return action.origin === location.origin && !action.username && !action.password;
+    };
     const signupLabels = ['sign up','sign up for free','create account','зарегистрироваться','зарегистрироваться бесплатно','бесплатная регистрация','создать аккаунт'];
     const passwordLabels = ['continue with password','продолжить с паролем','продолжить с помощью пароля'];
     const primaryLabels = ['continue','next','submit','verify','confirm','create account','продолжить','далее','подтвердить','проверить','создать аккаунт'];

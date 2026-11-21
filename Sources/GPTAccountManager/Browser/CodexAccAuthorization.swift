@@ -19,7 +19,10 @@ final class CodexAccAuthorization {
         let session: BrowserSession
         let policy: OAuthNavigationPolicy
         let generation: Int
+        let externalMail: ExternalLoginMailRequest?
         var submitted: Set<String> = []
+        var passwordChoices: Set<URL> = []
+        var passwordSubmitted = false
         var observedURL: URL?
         var observedAt = ContinuousClock.now
     }
@@ -62,7 +65,8 @@ final class CodexAccAuthorization {
         try Task.checkCancellation()
         session.loadOAuth(authorizationURL, mode: .automatic)
         session.setVisible(true)
-        attempts[account.id] = Attempt(session: session, policy: policy, generation: session.cancellationGeneration)
+        attempts[account.id] = Attempt(session: session, policy: policy, generation: session.cancellationGeneration,
+                                       externalMail: browser.externalLoginMail(for: account, in: session))
         return session
     }
 
@@ -107,8 +111,36 @@ final class CodexAccAuthorization {
             return .manual("OpenAI вернул ошибку сервера. Проверьте страницу авторизации.")
         }
         let path = url.path.lowercased()
+        let emailCodeRoute = ChatGPTAutomation.isPasswordEmailCodeRoute(url)
+        if !attempt.passwordSubmitted, !account.password.isEmpty,
+           emailCodeRoute || ["/log-in", "/log-in-or-create-account"].contains(path) {
+            if attempt.passwordChoices.contains(url) { return .waiting }
+            if try await RegistrationForm.selectPasswordLogin(in: session) {
+                if emailCodeRoute { attempt.externalMail?.switchedToPassword() }
+                attempts[account.id]?.passwordChoices.insert(url)
+                return .waiting
+            }
+        }
+        let challenge = url.absoluteString
+        if emailCodeRoute, let externalMail = attempt.externalMail {
+            if attempt.submitted.contains(challenge) { return .waiting }
+            let state = try await RegistrationForm.inspect(in: session)
+            if state.kind == .unknown,
+               let observedAt = attempts[account.id]?.observedAt,
+               ContinuousClock.now < observedAt.advanced(by: .seconds(2)) { return .waiting }
+            if state.kind == .emailCode {
+                do {
+                    if try await externalMail.submit(in: session, state: state) {
+                        attempts[account.id]?.submitted.insert(challenge)
+                    }
+                    return .waiting
+                } catch let error as ExternalLoginMailError {
+                    return .manual(error.localizedDescription)
+                }
+            }
+        }
         if path.contains("email-verification") || path.contains("verify-email") ||
-            (path.hasPrefix("/mfa-challenge/") && Self.isEmailChallenge(text)) {
+            (path.hasPrefix("/mfa-challenge/") && ChatGPTAutomation.isEmailLoginChallenge(text)) {
             return .manual("OpenAI запросил код из письма. Введите его в браузере; импорт продолжится после проверки.")
         }
         if path == "/log-in/password", PasswordChangeForm.rejectsPassword(text) {
@@ -118,32 +150,41 @@ final class CodexAccAuthorization {
             return .manual("OpenAI отклонил код 2FA. Введите действующий код в браузере.")
         }
 
-        let challenge = url.absoluteString
         guard !attempt.submitted.contains(challenge) else { return .waiting }
         var submitted = false
         switch path {
-        case "/log-in":
-            submitted = try await EmailChangeAutomation.submitLoginEmail(account.email, in: session)
-        case "/log-in-or-create-account":
-            submitted = try await browser.fillAndSubmit(
-                selectors: ["input[type='email']"], value: account.email,
-                context: .authentication, in: session) == .submitted
+        case "/log-in", "/log-in-or-create-account":
+            submitted = try await ExternalLoginMailRequest.performTrigger(
+                request: attempt.externalMail, in: session, from: url, skipped: false, wasSubmitted: { $0 }
+            ) {
+                if path == "/log-in" { return try await EmailChangeAutomation.submitLoginEmail(account.email, in: session) }
+                return try await browser.fillAndSubmit(selectors: ["input[type='email']"], value: account.email,
+                                                       context: .authentication, in: session, expectedPageURL: url) == .submitted
+            }
         case "/log-in/password":
-            submitted = try await browser.fillAndSubmit(
-                selectors: ["input[type='password']"], value: account.password,
-                context: .authentication, in: session,
-                expectedPageURL: url, expectedEmail: account.email) == .submitted
+            submitted = try await ExternalLoginMailRequest.performTrigger(
+                request: attempt.externalMail, in: session, from: url, skipped: false, wasSubmitted: { $0 }
+            ) {
+                try await browser.fillAndSubmit(selectors: ["input[type='password']"], value: account.password,
+                                                context: .authentication, in: session, expectedPageURL: url,
+                                                expectedEmail: account.email) == .submitted
+            }
+            if submitted { attempts[account.id]?.passwordSubmitted = true }
         case "/choose-an-account":
-            submitted = try await Self.chooseAccount(email: account.email, in: session)
+            submitted = try await ExternalLoginMailRequest.performTrigger(
+                request: attempt.externalMail, in: session, from: url, skipped: false, wasSubmitted: { $0 }
+            ) {
+                try await Self.chooseAccount(email: account.email, in: session)
+            }
         case let route where route.hasPrefix("/mfa-challenge/"):
             let delay = TOTPService.safeSubmissionDelay()
             if delay > 0 { try await Task.sleep(for: .seconds(delay + 0.15)) }
             try Task.checkCancellation()
             guard session.webView.url == url, attempt.generation == session.cancellationGeneration else { return .waiting }
             let code = try TOTPService.code(secret: account.totpSecret)
-            let result = try await browser.submitAuthenticationOTP(value: code, in: session)
+            let result = try await browser.submitAuthenticationOTP(value: code, in: session, expectedPageURL: url)
             submitted = result == .submitted
-            if ChatGPTAutomation.needsKeyboardMFAFallback(url: session.webView.url, formResult: result) {
+            if session.webView.url == url, ChatGPTAutomation.needsKeyboardMFAFallback(url: url, formResult: result) {
                 submitted = await session.submitMFAUsingKeyboard(code)
             }
         default:
@@ -166,11 +207,6 @@ final class CodexAccAuthorization {
         if let observedAt = attempts[account.id]?.observedAt,
            ContinuousClock.now < observedAt.advanced(by: .seconds(renderWait)) { return .waiting }
         return .manual("OpenAI ожидает действие в браузере. Проверьте выбранный аккаунт и продолжите авторизацию Codex.")
-    }
-
-    private static func isEmailChallenge(_ text: String) -> Bool {
-        text.range(of: #"check your (email|inbox)|email (?:verification|code)|code (?:we |that we )?sent|sent (?:a |an |the )?code|код[^\n]*(?:почт|email|письм)|проверьте[^\n]*почт"#,
-                   options: .regularExpression.union(.caseInsensitive)) != nil
     }
 
     private static let controlHelpers = #"""

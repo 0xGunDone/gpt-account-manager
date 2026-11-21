@@ -19,6 +19,7 @@ struct ImportedCredential: Equatable, Sendable {
     let email: String
     let password: String
     let totpSecret: String
+    var externalMailbox: ExternalMailboxConfiguration? = nil
 }
 
 struct AccountRecord: Identifiable, Codable, Equatable, Sendable {
@@ -45,6 +46,7 @@ struct AccountRecord: Identifiable, Codable, Equatable, Sendable {
     var pendingRegistration: PendingRegistration? = nil
     var proxy: AccountProxy? = nil
     var accessToken: String? = nil
+    var externalMailbox: ExternalMailboxConfiguration? = nil
 
     var pendingAccessChangeMode: AccessChangeMode? { pendingAccessChange ?? pendingPassword.map { _ in .password } }
     var hasPendingAccessChange: Bool { pendingAccessChangeMode != nil }
@@ -58,6 +60,7 @@ struct AccountRecord: Identifiable, Codable, Equatable, Sendable {
         email = credential.email
         password = credential.password
         totpSecret = credential.totpSecret
+        externalMailbox = credential.externalMailbox
         browserStoreID = UUID()
         status = .unchecked
     }

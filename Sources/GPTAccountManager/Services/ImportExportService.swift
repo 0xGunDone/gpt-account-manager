@@ -6,6 +6,7 @@ enum CredentialLineError: Error, Equatable {
     case invalidSecret
     case invalidSeparator
     case ambiguousFormat
+    case invalidMailboxBlock
 }
 
 enum CredentialImportSeparator: Equatable, Sendable {
@@ -14,6 +15,13 @@ enum CredentialImportSeparator: Equatable, Sendable {
 }
 
 enum ImportExportService {
+    private enum BlockField: String {
+        case email, password
+        case twoFA = "2fa"
+        case mailbox = "mailbox email"
+        case codeURL = "ссылка для кода с почты"
+    }
+
     static func parseCredentialLine(_ rawLine: String) throws -> ImportedCredential {
         try parseCredentialLine(rawLine, separator: "|")
     }
@@ -56,15 +64,25 @@ enum ImportExportService {
         var issues: [ImportIssue] = []
         var duplicates: [String] = []
 
-        for (offset, rawLine) in text.components(separatedBy: .newlines).enumerated() {
+        let lines = text.components(separatedBy: .newlines)
+        var nextLine = 0
+        while nextLine < lines.count {
+            let offset = nextLine
+            let rawLine = lines[offset]
+            nextLine += 1
             if rawLine.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
-            let credential: ImportedCredential
+            var credential: ImportedCredential
             do {
-                switch separator {
-                case .automatic:
-                    credential = try automaticallyParseCredentialLine(rawLine)
-                case let .literal(value):
-                    credential = try parseCredentialLine(rawLine, separator: value)
+                if let (field, email) = blockField(in: rawLine), field == .email,
+                   let result = try parseMailboxBlock(email: email, lines: lines, nextLine: &nextLine) {
+                    credential = result
+                } else {
+                    switch separator {
+                    case .automatic:
+                        credential = try automaticallyParseCredentialLine(rawLine)
+                    case let .literal(value):
+                        credential = try parseCredentialLine(rawLine, separator: value)
+                    }
                 }
             } catch {
                 issues.append(.init(
@@ -74,8 +92,11 @@ enum ImportExportService {
             }
 
             let key = credential.email.lowercased()
-            if values[key] != nil {
+            if let previous = values[key] {
                 if !duplicates.contains(key) { duplicates.append(key) }
+                if credential.externalMailbox == nil {
+                    credential.externalMailbox = previous.externalMailbox
+                }
             } else {
                 order.append(key)
             }
@@ -86,6 +107,56 @@ enum ImportExportService {
             records: order.compactMap { values[$0] },
             issues: issues,
             duplicateEmails: duplicates)
+    }
+
+    private static func blockField(in line: String) -> (BlockField, String)? {
+        guard let colon = line.firstIndex(of: ":"),
+              let field = BlockField(rawValue: line[..<colon].trimmingCharacters(in: .whitespaces).lowercased())
+        else { return nil }
+        let value = line[line.index(after: colon)...]
+        return (field, String(value.first == " " ? value.dropFirst() : value))
+    }
+
+    private static func parseMailboxBlock(
+        email: String, lines: [String], nextLine: inout Int
+    ) throws -> ImportedCredential? {
+        var fields: [BlockField: String] = [:]
+        var duplicateField = false
+        var offset = nextLine
+        while offset < lines.count {
+            let line = lines[offset]
+            if !line.allSatisfy(\.isWhitespace) {
+                guard let (field, value) = blockField(in: line), field != .email else { break }
+                if fields.updateValue(value, forKey: field) != nil { duplicateField = true }
+            }
+            offset += 1
+        }
+        guard !fields.isEmpty else { return nil }
+        nextLine = offset
+
+        let login = email.trimmingCharacters(in: .whitespaces)
+        guard !duplicateField, MailVerificationMatcher.normalizedAddress(login) != nil,
+              let password = fields[.password], !password.isEmpty,
+              let totpSecret = fields[.twoFA]?.trimmingCharacters(in: .whitespaces),
+              TOTPService.isValidSecret(totpSecret),
+              let mailbox = fields[.mailbox], let endpoint = fields[.codeURL],
+              let configuration = try? ExternalMailboxConfiguration(address: mailbox, codeURL: codeURL(in: endpoint))
+        else { throw CredentialLineError.invalidMailboxBlock }
+        return ImportedCredential(email: login, password: password, totpSecret: totpSecret,
+                                  externalMailbox: configuration)
+    }
+
+    private static func codeURL(in value: String) throws -> String {
+        let text = value.trimmingCharacters(in: .whitespaces)
+        guard text.hasPrefix("[") else { return text }
+        let link = try AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnly))
+        guard let url = link.runs.first?.link, link.runs.allSatisfy({ $0.link == url })
+        else { throw CredentialLineError.invalidMailboxBlock }
+        let label = String(link.characters)
+        if let displayedURL = URL(string: label), displayedURL.scheme != nil, displayedURL != url {
+            throw CredentialLineError.invalidMailboxBlock
+        }
+        return url.absoluteString
     }
 
     private static func automaticallyParseCredentialLine(_ rawLine: String) throws -> ImportedCredential {
@@ -123,6 +194,8 @@ enum ImportExportService {
             "Separator must not be empty or contain line breaks"
         case .ambiguousFormat:
             "Ambiguous separators; choose a separator manually"
+        case .invalidMailboxBlock:
+            "Expected Email, Password, 2FA, Mailbox email, and valid HTTPS code URL"
         default:
             switch separator {
             case .literal("|"): "Expected LOGIN|PASS|2FA"

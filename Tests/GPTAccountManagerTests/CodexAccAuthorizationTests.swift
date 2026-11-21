@@ -293,4 +293,41 @@ struct CodexAccAuthorizationTests {
         #expect(try await session.evaluate("document.querySelector('input').value") as? String == "")
         #expect(try await session.evaluate("document.body.dataset.count === undefined") as? Bool == true)
     }
+
+    @Test func codexPrefersPasswordAndUsesConfiguredMailboxCodeOnce() async throws {
+        var configured = account
+        configured.externalMailbox = try ExternalMailboxConfiguration(address: "inbox@example.com", codeURL: "https://inbox.example.com/code")
+        let session = session()
+        let mailbox = ExternalLoginMailboxFixture()
+        let browser = ChatGPTAutomation(sessionManager: WebSessionManager(accountSessionFactory: { _ in session }),
+                                        makeExternalMailbox: { _ in mailbox })
+        let authorization = CodexAccAuthorization(browser: browser)
+        _ = try await authorization.prepare(account: configured, authorizationURL: authorizationURL())
+        try await load("""
+        \(form("<input type='email'>"))
+        <a href='/log-in/password' onclick='event.preventDefault();document.body.dataset.password="chosen"'>Continue with password</a>
+        """, in: session, path: "/log-in-or-create-account")
+        #expect(try await authorization.advance(account: configured, in: session) == .waiting)
+        #expect(try await authorization.advance(account: configured, in: session) == .waiting)
+        #expect(try await session.evaluate("document.body.dataset.password") as? String == "chosen")
+        #expect(try await session.evaluate("document.querySelector('input').value") as? String == "")
+        #expect(mailbox.captures == 0)
+
+        try await load("<main><p>owner@example.com</p>\(form("<input type='password'>"))</main>", in: session, path: "/log-in/password")
+        mailbox.beforeCapture = { () async throws in
+            let value = try await session.evaluate("document.querySelector('input').value") as? String
+            #expect(value == "")
+        }
+        #expect(try await authorization.advance(account: configured, in: session) == .waiting)
+        #expect(try await session.evaluate("document.body.dataset.count") as? String == "1")
+        #expect(mailbox.captures == 1)
+
+        try await load("<main><p>Code sent to owner@example.com</p>\(form("<input name='code' autocomplete='one-time-code'>"))</main>",
+                       in: session, path: "/email-verification")
+        #expect(try await authorization.advance(account: configured, in: session) == .waiting)
+        #expect(try await authorization.advance(account: configured, in: session) == .waiting)
+        #expect(try await session.evaluate("document.querySelector('input').value") as? String == "123456")
+        #expect(try await session.evaluate("document.body.dataset.count") as? String == "1")
+        #expect(mailbox.reads == 1)
+    }
 }

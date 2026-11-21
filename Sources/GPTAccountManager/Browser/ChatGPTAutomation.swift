@@ -279,6 +279,11 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
             pageText.contains("invalid code")
     }
 
+    static func isEmailLoginChallenge(_ text: String) -> Bool {
+        text.range(of: #"check your (email|inbox)|email (?:verification|code)|code (?:we |that we )?sent|sent (?:a |an |the )?code|код[^\n]*(?:почт|email|письм)|проверьте[^\n]*почт"#,
+                   options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
     static func displaySession(
         accountID: UUID,
         verificationSessions: [UUID: BrowserSession],
@@ -368,6 +373,7 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
 
     private let sessionManager: WebSessionManager
     private let passwordMailbox: (any EmailCodeReceiving)?
+    private let makeExternalMailbox: @MainActor (ExternalMailboxConfiguration) -> any EmailCodeReceiving
     private var subscriptionCheckSessions: [UUID: BrowserSession] = [:]
     private var rotationSessions: [UUID: BrowserSession] = [:]
     private var preparedRotationSessionIDs: Set<UUID> = []
@@ -461,9 +467,17 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
     private(set) var activeSession: BrowserSession?
     var maximumConcurrentRotations: Int { 1 }
 
-    init(sessionManager: WebSessionManager, passwordMailbox: (any EmailCodeReceiving)? = nil) {
+    init(sessionManager: WebSessionManager, passwordMailbox: (any EmailCodeReceiving)? = nil,
+         makeExternalMailbox: @escaping @MainActor (ExternalMailboxConfiguration) -> any EmailCodeReceiving = {
+             ExternalMailboxCodeClient(configuration: $0)
+         }) {
         self.sessionManager = sessionManager
         self.passwordMailbox = passwordMailbox
+        self.makeExternalMailbox = makeExternalMailbox
+    }
+
+    func externalLoginMail(for account: AccountRecord, in session: BrowserSession) -> ExternalLoginMailRequest? {
+        account.externalMailbox.map { ExternalLoginMailRequest(mailbox: makeExternalMailbox($0), email: account.email, in: session) }
     }
 
     func hasCandidateSession(for accountID: UUID) -> Bool {
@@ -2694,6 +2708,8 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
         beforePasswordSubmission: (@MainActor (BrowserSession) async throws -> Void)? = nil,
         emailCodeHandler: (@MainActor (BrowserSession) async throws -> Bool)? = nil
     ) async -> SignInResult {
+        let externalMail = emailCodeHandler == nil ? externalLoginMail(for: account, in: session) : nil
+        let automaticallyWaitForTransitions = automaticallyWaitForTransitions || externalMail != nil
         let clock = ContinuousClock()
         var deadline = clock.now.advanced(by: .seconds(loginTimeoutSeconds))
         var limit = clock.now.advanced(by: .seconds(loginTimeoutSeconds + humanChallengeTimeoutSeconds))
@@ -2850,7 +2866,9 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
             }
 
             do {
-                let stage = "\(session.webView.url?.host ?? "")\(session.webView.url?.path ?? "")"
+                let pageURL = session.webView.url
+                let path = pageURL?.path.lowercased() ?? ""
+                let stage = "\(pageURL?.host ?? "")\(pageURL?.path ?? "")"
                 if let registrationProfileHandler,
                    recoveryPageURL?.host?.lowercased() == "auth.openai.com",
                    recoveryPageURL?.path == "/about-you" {
@@ -2865,11 +2883,12 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                     }
                     continue
                 }
-                if session.webView.url?.host?.lowercased() == "auth.openai.com",
-                   ["/email-verification", "/verify-email"].contains(session.webView.url?.path.lowercased() ?? "") {
+                if Self.isPasswordEmailCodeRoute(pageURL) {
                     if !proof.passwordSubmitted,
+                       !account.password.isEmpty,
                        !automaticallyWaitForTransitions || !submittedStages.contains(stage + ":passwordChoice"),
                        try await RegistrationForm.selectPasswordLogin(in: session) {
+                        externalMail?.switchedToPassword()
                         submittedStages.insert(stage + ":passwordChoice")
                         if automaticallyWaitForTransitions {
                             deadline = min(limit, clock.now.advanced(by: .seconds(loginTimeoutSeconds)))
@@ -2892,8 +2911,13 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                        emailState.displayedEmail?.caseInsensitiveCompare(account.email) != .orderedSame {
                         return .manual("Код входа отправлен на другой адрес. Проверьте аккаунт в браузере.", proof)
                     }
-                    if emailState.kind == .emailCode, let emailCodeHandler {
-                        if try await emailCodeHandler(session) {
+                    if emailState.kind == .emailCode, externalMail != nil || emailCodeHandler != nil {
+                        let submitted = if let externalMail {
+                            try await externalMail.submit(in: session, state: emailState)
+                        } else {
+                            try await emailCodeHandler?(session) == true
+                        }
+                        if submitted {
                             submittedStages.insert(stage + ":emailCode")
                             if automaticallyWaitForTransitions {
                                 deadline = min(limit, clock.now.advanced(by: .seconds(loginTimeoutSeconds)))
@@ -2913,19 +2937,45 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                     }
                     return .manual("Подтвердите вход кодом из почты. Код из письма не является кодом 2FA.", proof)
                 }
+                if externalMail != nil,
+                   pageURL?.host?.lowercased() == "auth.openai.com", path.hasPrefix("/mfa-challenge/"),
+                   Self.isEmailLoginChallenge(try await authenticationPageText(in: session)) {
+                    return .manual("Подтвердите вход кодом из письма в браузере.", proof)
+                }
+                if pageURL?.host?.lowercased() == "auth.openai.com", ["/log-in", "/log-in-or-create-account"].contains(path),
+                   !proof.passwordSubmitted, !account.password.isEmpty {
+                    if !submittedStages.contains(stage + ":passwordChoice"),
+                       try await RegistrationForm.selectPasswordLogin(in: session) {
+                        submittedStages.insert(stage + ":passwordChoice")
+                        deadline = min(limit, clock.now.advanced(by: .seconds(loginTimeoutSeconds)))
+                        await waitAfterSubmission(in: session)
+                        continue
+                    }
+                    if submittedStages.contains(stage + ":passwordChoice") {
+                        try await Task.sleep(for: .milliseconds(250))
+                        continue
+                    }
+                }
                 let recoveryAllowsEmail = !isRegistrationRecovery ||
                     (recoveryPageURL?.host?.lowercased() == "auth.openai.com" &&
                      ["/", "/log-in", "/log-in-or-create-account"].contains(recoveryPageURL?.path ?? "")) ||
                     (recoveryPageURL?.host?.lowercased() == "chatgpt.com" &&
                      ["/", "/auth/login"].contains(recoveryPageURL?.path ?? ""))
-                let emailResult: FormResult = !recoveryAllowsEmail ||
-                    (automaticallyWaitForTransitions && submittedStages.contains(stage + ":email"))
-                    ? .notFound : try await fillAndSubmit(
-                    selectors: emailSelectors,
-                    value: account.email,
-                    context: .authentication,
-                    in: session,
-                    expectedPageURL: recoveryPageURL)
+                let externalEmailRoute = (pageURL?.host?.lowercased() == "auth.openai.com" && ["/", "/log-in", "/log-in-or-create-account"].contains(path)) ||
+                    (pageURL?.host?.lowercased() == "chatgpt.com" && ["", "/", "/auth/login"].contains(path))
+                let emailResult: FormResult
+                if !recoveryAllowsEmail || (externalMail != nil && !externalEmailRoute) ||
+                    (automaticallyWaitForTransitions && submittedStages.contains(stage + ":email")) {
+                    emailResult = .notFound
+                } else {
+                    emailResult = try await ExternalLoginMailRequest.performTrigger(
+                        request: externalMail, in: session, from: pageURL, skipped: .notFound,
+                        wasSubmitted: { $0 == .submitted }
+                    ) {
+                        try await fillAndSubmit(selectors: emailSelectors, value: account.email, context: .authentication,
+                                                in: session, expectedPageURL: externalMail == nil ? recoveryPageURL : pageURL)
+                    }
+                }
                 if emailResult == .ambiguous || emailResult == .noForm {
                     return .manual("The login page is ambiguous. Continue in the browser.", proof)
                 }
@@ -2944,11 +2994,13 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                    session.webView.url?.path.lowercased() == "/choose-an-account",
                    !automaticallyWaitForTransitions || !submittedStages.contains(stage + ":account")
                 {
-                    let choice = try await clickUniqueControl(
-                        labels: [account.email],
-                        click: true,
-                        in: session,
-                        expectedPageURL: recoveryPageURL)
+                    let choice: ControlResult = try await ExternalLoginMailRequest.performTrigger(
+                        request: externalMail, in: session, from: pageURL, skipped: .notFound,
+                        wasSubmitted: { $0 == .clicked }
+                    ) {
+                        try await clickUniqueControl(labels: [account.email], click: true, in: session,
+                                                     expectedPageURL: externalMail == nil ? recoveryPageURL : pageURL)
+                    }
                     if choice == .ambiguous {
                         return .manual("The account chooser is ambiguous. Continue in the browser.", proof)
                     }
@@ -2961,9 +3013,12 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                         continue
                     }
                 }
-                if emailResult == .notFound,
+                if emailResult == .notFound, pageURL?.host?.lowercased() == "chatgpt.com", ["/", "/auth/login"].contains(path),
                    !submittedStages.contains(stage + ":remembered"),
-                   try await RegistrationForm.selectRememberedAccount(account.email, in: session) {
+                   try await ExternalLoginMailRequest.performTrigger(request: externalMail, in: session, from: pageURL,
+                                                                    skipped: false, wasSubmitted: { $0 }, submit: {
+                       try await RegistrationForm.selectRememberedAccount(account.email, in: session)
+                   }) {
                     submittedStages.insert(stage + ":remembered")
                     deadline = min(limit, clock.now.advanced(by: .seconds(loginTimeoutSeconds)))
                     await waitAfterSubmission(in: session)
@@ -2992,7 +3047,7 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                 let passwordResult: FormResult
                 if automaticallyWaitForTransitions && submittedStages.contains(stage + ":password") {
                     passwordResult = .notFound
-                } else if (requireExplicitProof || isRegistrationRecovery || passwordLoginRequest != nil) && (session.webView.url?.host?.lowercased() != "auth.openai.com" ||
+                } else if (requireExplicitProof || isRegistrationRecovery || passwordLoginRequest != nil || externalMail != nil) && (session.webView.url?.host?.lowercased() != "auth.openai.com" ||
                     session.webView.url?.path.lowercased() != "/log-in/password") {
                     passwordResult = .notFound
                 } else {
@@ -3015,13 +3070,15 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                         }
                         preparedPasswordStages.insert(stage)
                     }
-                    passwordResult = try await fillAndSubmit(
-                        selectors: passwordSelectors,
-                        value: account.password,
-                        context: .authentication,
-                        in: session,
-                        expectedPageURL: passwordLoginRequest != nil || beforePasswordSubmission != nil ? passwordPageURL : recoveryPageURL,
-                        expectedEmail: isRegistrationRecovery || passwordLoginRequest != nil || beforePasswordSubmission != nil ? account.email : nil)
+                    passwordResult = try await ExternalLoginMailRequest.performTrigger(
+                        request: externalMail, in: session, from: passwordPageURL, skipped: .notFound,
+                        wasSubmitted: { $0 == .submitted }
+                    ) {
+                        try await fillAndSubmit(
+                            selectors: passwordSelectors, value: account.password, context: .authentication, in: session,
+                            expectedPageURL: passwordLoginRequest != nil || beforePasswordSubmission != nil || externalMail != nil ? passwordPageURL : recoveryPageURL,
+                            expectedEmail: isRegistrationRecovery || passwordLoginRequest != nil || beforePasswordSubmission != nil || externalMail != nil ? account.email : nil)
+                    }
                 }
                 if passwordResult == .ambiguous || passwordResult == .noForm {
                     return .manual("The password page is ambiguous. Continue in the browser.", proof)
@@ -3073,11 +3130,14 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                     try await Task.sleep(for: .milliseconds(250))
                     continue
                 }
-                if passwordLoginRequest != nil,
+                if passwordLoginRequest != nil || externalMail != nil,
                    session.webView.url?.host?.lowercased() != "auth.openai.com" ||
                     session.webView.url?.path.lowercased().hasPrefix("/mfa-challenge/") != true {
                     try await Task.sleep(for: .milliseconds(250))
                     continue
+                }
+                if externalMail != nil, !TOTPService.isValidSecret(secret) {
+                    return .manual("OpenAI запросил код приложения-аутентификатора. Введите его в браузере.", proof)
                 }
                 if isRegistrationRecovery {
                     guard recoveryPageURL?.host?.lowercased() == "auth.openai.com",
@@ -3100,14 +3160,22 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                    operationIsCancelled || generation != session.cancellationGeneration {
                     return .failure("Stopped")
                 }
+                let otpPageURL = session.webView.url
+                let isMFAChallenge = otpPageURL?.host?.lowercased() == "auth.openai.com" &&
+                    otpPageURL?.path.lowercased().hasPrefix("/mfa-challenge/") == true
+                if (requireExplicitProof || externalMail != nil) && !isMFAChallenge { continue }
+                if Self.isPasswordEmailCodeRoute(otpPageURL) { continue }
+                if externalMail != nil {
+                    let text = try await authenticationPageText(in: session)
+                    guard otpPageURL == session.webView.url else { continue }
+                    if Self.isEmailLoginChallenge(text) {
+                        return .manual("Подтвердите вход кодом из письма в браузере.", proof)
+                    }
+                }
                 let code = try TOTPService.code(secret: secret)
-                let isMFAChallenge = session.webView.url?.host?.lowercased() == "auth.openai.com" &&
-                    session.webView.url?.path.lowercased().hasPrefix("/mfa-challenge/") == true
-                if requireExplicitProof && !isMFAChallenge { continue }
-                if session.webView.url?.host?.lowercased() == "auth.openai.com",
-                   ["/email-verification", "/verify-email"].contains(session.webView.url?.path.lowercased() ?? "") { continue }
                 var otpResult = try await submitAuthenticationOTP(value: code, in: session,
-                                                                  expectedPageURL: recoveryPageURL)
+                                                                  expectedPageURL: externalMail == nil ? recoveryPageURL : otpPageURL)
+                if externalMail != nil, otpPageURL != session.webView.url, otpResult != .submitted { continue }
                 if Self.needsKeyboardMFAFallback(
                     url: session.webView.url,
                     formResult: otpResult)
@@ -3163,6 +3231,9 @@ final class ChatGPTAutomation: SubscriptionChecking, TwoFARotating, PasswordChan
                 }
                 if error is RegistrationForm.ProfileRetryError {
                     return .failure(RegistrationForm.rejectionMessage)
+                }
+                if let error = error as? ExternalLoginMailError {
+                    return .manual(error.localizedDescription, proof)
                 }
                 if emailCodeHandler != nil,
                    error is PasswordEmailAutomationError || error is MailVerificationError {

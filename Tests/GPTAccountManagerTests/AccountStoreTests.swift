@@ -128,6 +128,43 @@ import Testing
         }
     }
 
+    @Test func externalMailboxRemainsLocalAcrossCredentialRefreshAndTrashRestore() throws {
+        let original = try populatedStore()
+        defer { try? FileManager.default.removeItem(at: original.fileURL.deletingLastPathComponent()) }
+        let store = AccountStore(fileURL: original.fileURL)
+        try store.load()
+        let account = try #require(store.accounts.first)
+        let otherAccount = try #require(store.accounts.last)
+        #expect(account.externalMailbox == nil)
+
+        let mailbox = try ExternalMailboxConfiguration(
+            address: "inbox@example.com", codeURL: "https://mail.example.com/code?token=fixture")
+        try store.updateExternalMailbox(id: account.id, configuration: mailbox, protectedIDs: [])
+        #expect(ImportExportService.serialize(store.accounts) == ImportExportService.serialize(original.accounts))
+        #expect(throws: AccountStoreError.accountBusy) {
+            try store.updateExternalMailbox(id: account.id, configuration: nil, protectedIDs: [account.id])
+        }
+        try store.updateCredentials(id: account.id, credential: .init(
+            email: "ONE@example.com", password: "refreshed", totpSecret: account.totpSecret), protectedIDs: [])
+        try store.deleteAccount(id: account.id, protectedIDs: [])
+        try store.load()
+        let snapshotID = try #require(store.deletedAccounts.first?.id)
+        try store.restoreDeletedAccount(id: snapshotID, protectedIDs: [])
+
+        try store.load()
+        #expect(store.accounts.first { $0.id == account.id }?.externalMailbox == mailbox)
+        #expect(store.accounts.first { $0.id == otherAccount.id } == otherAccount)
+        try store.updateExternalMailbox(id: account.id, configuration: nil, protectedIDs: [])
+        try store.load()
+        #expect(store.accounts.first { $0.id == account.id }?.externalMailbox == nil)
+
+        try store.updateExternalMailbox(id: account.id, configuration: mailbox, protectedIDs: [])
+        try store.updateCredentials(id: account.id, credential: .init(
+            email: "changed@example.com", password: "refreshed", totpSecret: account.totpSecret), protectedIDs: [])
+        try store.load()
+        #expect(store.accounts.first { $0.id == account.id }?.externalMailbox == nil)
+    }
+
     @Test func accountAndGroupTagsPersistAfterReload() throws {
         let file = try temporaryFile()
         let store = try populatedStore(fileURL: file)
