@@ -85,6 +85,82 @@ struct EmailReauthenticationCodeTests {
         Issue.record("Authentication code was not submitted")
     }
 
+    @Test(arguments: [EmailChangePhase.reserved, .confirming])
+    func passwordOptionRunsBeforeMailboxLookup(phase: EmailChangePhase) async throws {
+        let original = BrowserSession(dataStore: .nonPersistent())
+        let mailbox = ReauthenticationMailbox()
+        let changer = EmailChangeAutomation(browser: ChatGPTAutomation(
+            sessionManager: WebSessionManager(accountSessionFactory: { _ in original })), mailbox: mailbox)
+        let candidate = account(phase: phase)
+        var session = original
+        if phase == .confirming {
+            try #require(changer.resetVerificationSession(for: candidate))
+            session = try #require(changer.browserSession(for: candidate))
+        }
+        let email = phase == .confirming ? "reserved@icloud.com" : "old@example.com"
+        try await load("""
+        \(codeForm(email: email))
+        <button type="button" onclick="choosePassword()">Продолжить с паролем</button>
+        <script>
+          function choosePassword() {
+            document.body.dataset.choiceCount = String(Number(document.body.dataset.choiceCount || 0) + 1);
+            setTimeout(() => {
+              history.replaceState({}, '', '/log-in/password');
+              document.body.innerHTML = '<form><input type="password"><button>Continue</button></form>';
+              document.querySelector('form').onsubmit = event => {
+                event.preventDefault();
+                document.body.dataset.password = document.querySelector('input').value;
+              };
+            }, 600);
+          }
+        </script>
+        """, path: "/email-verification", in: session)
+        let task = Task { await changer.changeEmail(account: candidate) { _ in Issue.record("Unexpected checkpoint") } }
+        defer { changer.cancel(); task.cancel() }
+        for _ in 0..<160 {
+            if try await session.evaluate("document.body.dataset.password === 'fixture-password'") as? Bool == true { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        changer.cancel()
+        _ = await task.value
+        #expect(try await session.evaluate("document.body.dataset.password") as? String == "fixture-password")
+        #expect(try await session.evaluate("document.body.dataset.choiceCount") as? String == "1")
+        #expect(mailbox.requests.isEmpty)
+    }
+
+    @Test func passwordPageInterruptsPendingMailboxLookup() async throws {
+        let session = BrowserSession(dataStore: .nonPersistent())
+        try await load(passwordThenCode(email: "old@example.com"), path: "/log-in/password", in: session)
+        let mailbox = ReauthenticationMailbox()
+        let changer = EmailChangeAutomation(browser: ChatGPTAutomation(
+            sessionManager: WebSessionManager(accountSessionFactory: { _ in session })), mailbox: mailbox)
+        var lookupEnded = false
+        mailbox.onCode = {
+            defer { lookupEnded = true }
+            try await Task.sleep(for: .seconds(60))
+        }
+        let task = Task { await changer.changeEmail(account: account()) { _ in Issue.record("Unexpected checkpoint") } }
+        defer { changer.cancel(); task.cancel() }
+        for _ in 0..<160 where mailbox.requests.isEmpty {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        try #require(mailbox.requests.count == 1)
+        try await load("""
+        <form onsubmit="event.preventDefault();document.body.dataset.password=document.querySelector('input').value">
+          <input type="password"><button>Continue</button>
+        </form>
+        """, path: "/log-in/password?method=password", in: session)
+        for _ in 0..<160 {
+            if try await session.evaluate("document.body.dataset.password === 'fixture-password'") as? Bool == true { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        #expect(lookupEnded)
+        #expect(try await session.evaluate("document.body.dataset.password") as? String == "fixture-password")
+        #expect(mailbox.requests.count == 1)
+        changer.cancel()
+        _ = await task.value
+    }
+
     @Test(arguments: [false, true])
     func delayedLoginCodeKeepsPollingWithOriginalBaselineAndSubmitsOnlyOnce(interruptedReply: Bool) async throws {
         let session = BrowserSession(dataStore: .nonPersistent())

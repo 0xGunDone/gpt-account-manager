@@ -577,19 +577,44 @@ final class EmailChangeAutomation: EmailChanging {
         generation: Int, submitted: inout Set<String>
     ) async throws -> Bool {
         guard generation == cancellationGeneration, !Task.isCancelled else { throw CancellationError() }
+        let challengeURL = session.webView.url
         if kind == .emailChallenge {
-            return try await submitAuthenticationMailCode(account: account, in: session, generation: generation)
+            let preferPassword = !account.password.isEmpty && !submitted.contains { $0.hasPrefix("password:") }
+            if preferPassword {
+                if submitted.contains("passwordChoice") { return false }
+                if try await submitOnce(in: session, generation: generation, {
+                    try await RegistrationForm.selectPasswordLogin(in: session)
+                }) {
+                    submitted.insert("passwordChoice")
+                    authenticationMailRequests.removeValue(forKey: ObjectIdentifier(session))
+                    session.setOperationMessage("Смена email: ожидается форма входа с паролем…")
+                    return true
+                }
+                guard session.webView.url == challengeURL else { return false }
+            }
+            return try await submitAuthenticationMailCode(account: account, in: session, generation: generation,
+                                                          preferPassword: preferPassword)
         }
         guard kind == .password || kind == .totp else { return false }
-        let challengeURL = session.webView.url
         let challenge = "\(kind.rawValue):\(challengeURL?.absoluteString ?? "")"
         guard !submitted.contains(challenge) else { return false }
+        if kind == .password {
+            guard challengeURL?.host?.lowercased() == "auth.openai.com",
+                  challengeURL?.path.lowercased() == "/log-in/password" else { return false }
+            guard !account.password.isEmpty else { throw EmailAutomationError.manualLogin }
+            let key = ObjectIdentifier(session)
+            if authenticationMailRequests[key]?.challengeURL != nil {
+                authenticationMailRequests.removeValue(forKey: key)
+            }
+        }
         try await prepareAuthenticationMail(account: account, in: session, generation: generation)
+        guard session.webView.url == challengeURL else { return false }
         if kind == .password {
             session.setOperationMessage("Смена email: подтверждается текущий пароль…")
             if try await submitOnce(in: session, generation: generation, {
                 try await browser.fillAndSubmit(selectors: ["input[type='password']"], value: account.password,
-                                                context: .authentication, in: session) == .submitted
+                                                context: .authentication, in: session,
+                                                expectedPageURL: challengeURL, expectedEmail: account.email) == .submitted
             }) {
                 submitted.insert(challenge)
             }
@@ -644,7 +669,8 @@ final class EmailChangeAutomation: EmailChanging {
             requestedAt: Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970)))
     }
 
-    private func submitAuthenticationMailCode(account: AccountRecord, in session: BrowserSession, generation: Int) async throws -> Bool {
+    private func submitAuthenticationMailCode(account: AccountRecord, in session: BrowserSession, generation: Int,
+                                              preferPassword: Bool) async throws -> Bool {
         guard generation == cancellationGeneration, !Task.isCancelled else { throw CancellationError() }
         let state = try await readPage(in: session, generation: generation) {
             try await RegistrationForm.inspect(in: session)
@@ -665,25 +691,60 @@ final class EmailChangeAutomation: EmailChanging {
         guard request.challengeURL == nil || request.challengeURL == challengeURL else {
             throw EmailAutomationError.emailChallenge
         }
+        let token = UUID().uuidString
+        let email = account.email
+        let browserGeneration = session.cancellationGeneration
+        guard try await RegistrationForm.emailCodeScreenMatches(
+            in: session, expectedEmail: email, pageURL: challengeURL, token: token, capture: true
+        ) else { return false }
+        let isCurrentScreen: @MainActor @Sendable () async throws -> Bool = {
+            guard generation == self.cancellationGeneration, !Task.isCancelled else { throw CancellationError() }
+            guard session.cancellationGeneration == browserGeneration, session.webView.url == challengeURL else { return false }
+            do {
+                if preferPassword, try await RegistrationForm.selectPasswordLogin(in: session, click: false) { return false }
+                return try await RegistrationForm.emailCodeScreenMatches(
+                    in: session, expectedEmail: email, pageURL: challengeURL, token: token)
+            } catch {
+                guard generation == self.cancellationGeneration, !Task.isCancelled else { throw CancellationError() }
+                return false
+            }
+        }
+        guard try await isCurrentScreen() else { return false }
         session.setOperationMessage("Смена email: ожидается код входа на \(account.email)…")
         if request.receivedCode == nil {
             request.challengeURL = challengeURL
             authenticationMailRequests[key] = request
+            let requestedAt = request.requestedAt
+            let baseline = request.baseline
             do {
-                request.receivedCode = try await mailbox.waitForCode(alias: account.email, since: request.requestedAt,
-                                                                   excluding: request.baseline, purpose: .login)
+                request.receivedCode = try await withThrowingTaskGroup(of: MailVerificationCode?.self) { group in
+                    defer { group.cancelAll(); mailbox.cancel() }
+                    group.addTask { @MainActor @Sendable in
+                        try await self.mailbox.waitForCode(alias: email, since: requestedAt,
+                                                           excluding: baseline, purpose: .login)
+                    }
+                    group.addTask { @MainActor @Sendable in
+                        while try await isCurrentScreen() { try await Task.sleep(for: .milliseconds(350)) }
+                        return nil
+                    }
+                    return try await group.next() ?? nil
+                }
             } catch MailVerificationError.timedOut {
                 guard generation == cancellationGeneration, !Task.isCancelled else { throw CancellationError() }
+                guard try await isCurrentScreen() else { return false }
                 session.setOperationMessage("Код входа ещё не пришёл. Поиск продолжается автоматически с прежним временем запроса…")
                 return false
+            } catch {
+                guard try await isCurrentScreen() else { return false }
+                throw error
             }
         }
-        guard generation == cancellationGeneration, !Task.isCancelled else { throw CancellationError() }
+        guard let code = request.receivedCode, try await isCurrentScreen() else { return false }
         authenticationMailRequests[key] = request
         let readinessDeadline = ContinuousClock.now.advanced(by: .seconds(5))
         while ContinuousClock.now < readinessDeadline {
             guard generation == cancellationGeneration, !Task.isCancelled else { throw CancellationError() }
-            guard session.webView.url == challengeURL else { return false }
+            guard try await isCurrentScreen() else { return false }
             let latest = try await readPage(in: session, generation: generation) {
                 try await RegistrationForm.inspect(in: session)
             }
@@ -693,9 +754,8 @@ final class EmailChangeAutomation: EmailChanging {
                       latest.displayedEmail?.caseInsensitiveCompare(account.email) == .orderedSame else {
                     throw EmailAutomationError.emailChallenge
                 }
-                if let code = request.receivedCode,
-                   try await submitOnce(in: session, generation: generation, {
-                       try await RegistrationForm.submitEmailCode(code.code, expectedEmail: account.email, in: session)
+                if try await submitOnce(in: session, generation: generation, {
+                       try await RegistrationForm.submitEmailCode(code.code, expectedEmail: email, observedScreenOnly: true, in: session)
                    }) {
                     request.submittedURL = challengeURL
                     authenticationMailRequests[key] = request
@@ -712,8 +772,7 @@ final class EmailChangeAutomation: EmailChanging {
         var emailSent = false
         var loginOpened = false
         var accountChosen = false
-        var passwordSent = false
-        var otpSent = false
+        var submittedChallenges: Set<String> = []
         while true {
             guard generation == cancellationGeneration, !Task.isCancelled else { throw CancellationError() }
             reportContinuedWait(in: session, nextNotice: &nextWaitNotice)
@@ -727,33 +786,20 @@ final class EmailChangeAutomation: EmailChanging {
                 return
             }
             guard TrustedChatGPTOrigin.allowsAuthentication(session.webView.url) else { throw EmailAutomationError.manualLogin }
-            let path = session.webView.url?.path.lowercased() ?? ""
-            if path.contains("email-verification") || path.contains("verify-email") {
-                _ = try await submitAuthenticationMailCode(account: account, in: session, generation: generation)
+            let kind = try await readPage(in: session, generation: generation) {
+                try await EmailChangeForm.inspect(in: session).kind
+            }
+            if kind == .password || kind == .totp || kind == .emailChallenge {
+                if kind == .emailChallenge || !submittedChallenges.contains(where: { $0.hasPrefix("\(kind.rawValue):") }) {
+                    _ = try await reauthenticateIfNeeded(kind, account: account, in: session,
+                                                         generation: generation, submitted: &submittedChallenges)
+                }
                 try await Task.sleep(for: .milliseconds(350))
                 continue
             }
             try await prepareAuthenticationMail(account: account, in: session, generation: generation)
-            if path == "/log-in/password", !passwordSent {
-                passwordSent = try await submitOnce(in: session, generation: generation) {
-                    try await browser.fillAndSubmit(selectors: ["input[type='password']"], value: account.password,
-                                                    context: .authentication, in: session) == .submitted
-                }
-            } else if path.hasPrefix("/mfa-challenge/"), !otpSent {
-                let challengeURL = session.webView.url
-                let delay = TOTPService.safeSubmissionDelay(minimumRemaining: 10)
-                if delay > 0 { try await Task.sleep(for: .seconds(delay + 0.15)) }
-                guard generation == cancellationGeneration, !Task.isCancelled else { throw CancellationError() }
-                guard session.webView.url == challengeURL else { continue }
-                let code = try TOTPService.code(secret: account.totpSecret)
-                otpSent = try await submitOnce(in: session, generation: generation) {
-                    let result = try await EmailChangeForm.submitAuthenticatorCode(code, expectedPageURL: challengeURL, in: session)
-                    if ChatGPTAutomation.needsKeyboardMFAFallback(url: session.webView.url, formResult: result) {
-                        return await session.submitMFAUsingKeyboard(code)
-                    }
-                    return result == .submitted
-                }
-            } else if path == "/choose-an-account", session.webView.url?.host == "auth.openai.com", !accountChosen {
+            let path = session.webView.url?.path.lowercased() ?? ""
+            if path == "/choose-an-account", session.webView.url?.host == "auth.openai.com", !accountChosen {
                 accountChosen = try await submitOnce(in: session, generation: generation) {
                     try await browser.clickUniqueControl(labels: [account.email], click: true, in: session) == .clicked
                 }

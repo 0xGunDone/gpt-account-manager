@@ -65,8 +65,8 @@ enum RegistrationForm {
         try await clickControl(passwordPath: "/create-account/password", in: session)
     }
 
-    static func selectPasswordLogin(in session: BrowserSession) async throws -> Bool {
-        try await clickControl(passwordPath: "/log-in/password", in: session)
+    static func selectPasswordLogin(in session: BrowserSession, click: Bool = true) async throws -> Bool {
+        try await clickControl(passwordPath: "/log-in/password", in: session, click: click)
     }
 
     static func selectRememberedAccount(_ email: String, in session: BrowserSession) async throws -> Bool {
@@ -97,7 +97,7 @@ enum RegistrationForm {
         """) as? Bool == true
     }
 
-    private static func clickControl(passwordPath: String?, in session: BrowserSession) async throws -> Bool {
+    private static func clickControl(passwordPath: String?, in session: BrowserSession, click: Bool = true) async throws -> Bool {
         try requireTrustedOrigin(session)
         try Task.checkCancellation()
         let pathJSON = String(decoding: try JSONEncoder().encode(passwordPath), as: UTF8.self)
@@ -126,7 +126,7 @@ enum RegistrationForm {
                 : ['https://chatgpt.com','https://auth.openai.com'].includes(url.origin);
             });
           if (controls.length !== 1) return false;
-          controls[0].click();
+          if (\(click)) controls[0].click();
           return true;
         })()
         """) as? Bool == true
