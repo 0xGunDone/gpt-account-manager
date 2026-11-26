@@ -288,7 +288,7 @@ prepare_update() {
 
 no_app_running() {
   local status=0
-  /usr/bin/pgrep -x "$APP_EXECUTABLE" >/dev/null || status=$?
+  /usr/bin/pgrep -a -x "$APP_EXECUTABLE" >/dev/null || status=$?
   [[ $status == 1 ]]
 }
 
@@ -320,8 +320,9 @@ PY
 install_update() {
   local app_pid="$1" staged="$2" process_started target_commit
   [[ "$app_pid" =~ ^[1-9][0-9]*$ ]] || fail 'Invalid app PID.'
+  # macOS pgrep excludes ancestors by default, including the app that launched this helper.
   [[ "$(/bin/ps -ww -p "$app_pid" -o comm=)" == "$installed/Contents/MacOS/$APP_EXECUTABLE" &&
-     "$(/usr/bin/pgrep -x "$APP_EXECUTABLE")" == "$app_pid" ]] || fail 'Expected exactly one instance of the installed app.'
+     "$(/usr/bin/pgrep -a -x "$APP_EXECUTABLE")" == "$app_pid" ]] || fail 'Expected exactly one instance of the installed app.'
   process_started=$(/bin/ps -p "$app_pid" -o lstart=)
   canonical_directory "$root/.build" &&
     valid_bundle "$installed" && valid_stage "$staged" && same_signer "$staged" || fail 'App bundle validation failed.'
